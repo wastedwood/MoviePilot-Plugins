@@ -14,7 +14,7 @@
 
    ```yaml
    environment:
-     - PLUGIN_MARKET=https://github.com/jxxghp/MoviePilot-Plugins,https://github.com/<你的用户名>/MoviePilot-Plugins
+     - PLUGIN_MARKET=https://github.com/jxxghp/MoviePilot-Plugins,https://github.com/wastedwood/MoviePilot-Plugins
    ```
 
    > 仓库需为公开 GitHub 仓库，且默认分支为 `main`。
