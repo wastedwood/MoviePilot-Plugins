@@ -134,7 +134,7 @@ class PluginConfigTests(unittest.TestCase):
 
     def test_plugin_icon_uses_full_raw_url(self):
         self.assertTrue(self.plugin.plugin_icon.startswith("https://raw.githubusercontent.com/"))
-        self.assertTrue(self.plugin.plugin_icon.endswith("/icons/fntvdoubansync.png"))
+        self.assertTrue(self.plugin.plugin_icon.endswith("/icons/fntvdoubansync-logo.png"))
 
 
 # ── Cookie 解析优先级 ───────────────────────────────

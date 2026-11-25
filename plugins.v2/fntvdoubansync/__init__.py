@@ -34,9 +34,9 @@ class FntvDoubanSync(_PluginBase):
     # 插件描述
     plugin_desc = "只读解析飞牛影视（FNTV）观看记录，增量同步电影与剧集的在看/看过状态到豆瓣。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/wastedwood/MoviePilot-Plugins/main/icons/fntvdoubansync.png"
+    plugin_icon = "https://raw.githubusercontent.com/wastedwood/MoviePilot-Plugins/main/icons/fntvdoubansync-logo.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "wastedwood"
     # 作者主页
