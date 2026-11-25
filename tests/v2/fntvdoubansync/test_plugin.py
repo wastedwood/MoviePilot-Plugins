@@ -268,10 +268,40 @@ def test_api_status(plugin, fntv_db_file):
     status = plugin.api_status()
     assert status["running"] is False
     assert status["enabled"] is True
+    assert status["fntv_db_path"] == str(fntv_db_file)
     assert status["selected_user"] == "u1"
     assert status["cookie_source"] == "manual"
     assert status["last_sync_time"] == 0
-    assert status["stats"] == {"total": 0, "done": 0, "failed": 0}
+    assert status["last_run_at"] == 0
+    assert status["last_run_status"] == ""
+    assert status["last_run_message"] == ""
+    assert status["stats"] == {"total": 0, "done": 0, "doing": 0, "failed": 0}
+
+
+def test_init_plugin_empty_preserves_default_db_path(plugin):
+    plugin.init_plugin({})
+    assert plugin._fntv_db_path == "/fntv-db/trimmedia.db"
+
+
+def test_invalid_cron_handled_safely(plugin, fntv_db_file):
+    plugin.init_plugin(config_with(fntv_db_file, cron="invalid cron"))
+    assert plugin.get_service() == []
+    ret = plugin.api_save_config({"cron": "bad"})
+    assert ret["ok"] is False
+    assert "Cron" in ret["message"]
+
+
+def test_preflight_failure_logs_sync_error_and_last_run(plugin, fntv_db_file):
+    plugin.init_plugin(config_with(fntv_db_file, selected_user=""))
+    msg = plugin.sync()
+    assert "未选择" in msg
+    status = plugin.api_status()
+    assert status["last_run_at"] > 0
+    assert status["last_run_status"] == "error"
+    assert "未选择" in status["last_run_message"]
+    logs = plugin.api_logs(action="sync_error")
+    assert logs["total"] == 1
+    assert "未选择" in logs["items"][0]["detail"]
 
 
 def test_api_status_reports_running_and_cookiecloud_source(plugin, fntv_db_file):

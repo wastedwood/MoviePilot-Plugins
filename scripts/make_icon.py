@@ -1,38 +1,99 @@
-"""按 brand-mark.svg 构图重绘插件图标 icons/fntvdoubansync.png（512 画布渲染后缩至 128）"""
+"""重绘插件图标 icons/fntvdoubansync.png（1024 画布超采样渲染后缩至 128x128）"""
 
+import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
-NAVY = (8, 22, 43)
-BLUE = (52, 120, 229)
-GREEN = (0, 181, 106)
 
-S = 8  # 64 视图 → 512 画布
+SIZE = 1024
+OUT_SIZE = 128
+
+BG_TOP = (12, 24, 48, 255)
+BG_BOT = (22, 42, 78, 255)
+RIM_COLOR = (255, 255, 255, 26)
+CARD_SHADOW = (6, 12, 26, 130)
+FN_BLUE = (47, 118, 246, 255)
+FN_BLUE_LIGHT = (96, 165, 250, 255)
+PLAY_WHITE = (248, 251, 255, 255)
+DOUBAN_GREEN = (0, 181, 68, 255)
+DOUBAN_GREEN_RING = (16, 185, 129, 255)
+HALO_NAVY = (15, 30, 58, 255)
+
+
+def _rounded_mask(size: int, radius: int) -> Image.Image:
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=radius, fill=255)
+    return mask
+
+
+def _arc_point(cx: float, cy: float, r: float, deg: float) -> tuple[float, float]:
+    rad = math.radians(deg)
+    return cx + r * math.cos(rad), cy + r * math.sin(rad)
+
+
+def _draw_sync_arrows(draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, stroke: int):
+    bbox = (cx - r, cy - r, cx + r, cy + r)
+    # 上半圆弧 + 右下箭头
+    draw.arc(bbox, start=205, end=345, fill=PLAY_WHITE, width=stroke)
+    tip1 = _arc_point(cx, cy, r, 355)
+    b1a = _arc_point(cx, cy, r - stroke * 1.15, 330)
+    b1b = _arc_point(cx, cy, r + stroke * 1.15, 330)
+    draw.polygon([tip1, b1a, b1b], fill=PLAY_WHITE)
+
+    # 下半圆弧 + 左上箭头
+    draw.arc(bbox, start=25, end=165, fill=PLAY_WHITE, width=stroke)
+    tip2 = _arc_point(cx, cy, r, 175)
+    b2a = _arc_point(cx, cy, r - stroke * 1.15, 150)
+    b2b = _arc_point(cx, cy, r + stroke * 1.15, 150)
+    draw.polygon([tip2, b2a, b2b], fill=PLAY_WHITE)
 
 
 def main():
-    img = Image.new("RGBA", (64 * S, 64 * S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    # 1. 垂直渐变圆角底板
+    bg = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grad)
+    for y in range(SIZE):
+        t = y / (SIZE - 1)
+        col = tuple(int(BG_TOP[i] + (BG_BOT[i] - BG_TOP[i]) * t) for i in range(4))
+        gd.line([(0, y), (SIZE, y)], fill=col)
 
-    # 深蓝圆角底
-    d.rounded_rectangle((0, 0, 64 * S - 1, 64 * S - 1), radius=15 * S, fill=NAVY)
+    mask = _rounded_mask(SIZE, 224)
+    bg.paste(grad, (0, 0), mask)
 
-    # 蓝色横幅（顶部载具造型）
-    d.rounded_rectangle((12 * S, 88, 53.4 * S, 216), radius=56, fill=BLUE)
+    overlay = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle((6, 6, SIZE - 7, SIZE - 7), radius=218, outline=RIM_COLOR, width=6)
+    od.rounded_rectangle((174, 200, 758, 728), radius=108, fill=CARD_SHADOW)
+    bg = Image.alpha_composite(bg, overlay)
 
-    # 蓝色「F」字标
-    d.rectangle((200, 216, 347, 440), fill=BLUE)  # 竖笔
-    d.polygon([(278, 216), (392, 216), (348, 282), (278, 282)], fill=BLUE)  # 上横
-    d.polygon([(278, 316), (334, 316), (291, 380), (278, 380)], fill=BLUE)  # 中横
+    d = ImageDraw.Draw(bg)
 
-    # 绿色循环箭头（同步意象）
-    bbox = (98, 268, 298, 468)  # 圆心 (198,368) 半径 100
-    d.arc(bbox, start=150, end=420, fill=GREEN, width=58)
-    d.polygon([(230, 415), (300, 426), (256, 481)], fill=GREEN)  # 箭头头部
+    # 2. 飞牛影视主视觉卡片（蓝色媒体屏 + 顶部高光条 + 居中播放三角）
+    card_box = (160, 176, 744, 704)
+    d.rounded_rectangle(card_box, radius=108, fill=FN_BLUE)
+    # 顶部浅蓝装饰条
+    d.rounded_rectangle((224, 224, 680, 272), radius=24, fill=FN_BLUE_LIGHT)
+    # 播放按钮三角（圆润居中）
+    play_tri = [(376, 336), (376, 568), (576, 452)]
+    d.polygon(play_tri, fill=PLAY_WHITE)
 
-    icon = img.resize((128, 128), Image.LANCZOS)
+    # 3. 豆瓣同步绿标（右下角带深蓝隔离环的双箭头徽章）
+    cx, cy = 708, 708
+    halo_r = 186
+    badge_r = 152
+    d.ellipse((cx - halo_r, cy - halo_r, cx + halo_r, cy + halo_r), fill=HALO_NAVY)
+    d.ellipse((cx - badge_r, cy - badge_r, cx + badge_r, cy + badge_r), fill=DOUBAN_GREEN)
+    d.ellipse(
+        (cx - badge_r + 6, cy - badge_r + 6, cx + badge_r - 6, cy + badge_r - 6),
+        outline=DOUBAN_GREEN_RING,
+        width=6,
+    )
+    _draw_sync_arrows(d, cx, cy, r=74, stroke=26)
+
+    icon = bg.resize((OUT_SIZE, OUT_SIZE), Image.Resampling.LANCZOS)
     out = ROOT / "icons" / "fntvdoubansync.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     icon.save(out)

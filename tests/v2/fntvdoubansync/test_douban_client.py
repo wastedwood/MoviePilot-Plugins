@@ -273,6 +273,15 @@ class WishListTests(unittest.TestCase):
         get.return_value.json.return_value = {}
         self.assertTrue(client.remove_interest("123"))
 
+    @patch("app.plugins.fntvdoubansync.douban_client.requests.post")
+    def test_post_non_json_200_marks_unavailable(self, post):
+        resp = Mock(status_code=200, text="<html>captcha</html>")
+        resp.json.side_effect = ValueError("No JSON")
+        post.return_value = resp
+        client = DoubanClient("ck=test; dbcl2=login")
+        self.assertFalse(client._do_post("https://movie.douban.com/j/subject/1/interest", {"ck": "test"}, {}))
+        self.assertEqual(client.error_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

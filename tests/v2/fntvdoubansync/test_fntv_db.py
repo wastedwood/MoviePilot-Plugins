@@ -179,6 +179,27 @@ class FntvDbPathTests(unittest.TestCase):
             conn.execute("SELECT COUNT(*) FROM item").fetchone()
         self.assertTrue(Path(tempfile.gettempdir(), "trimmedia_tmp.db").exists())
 
+    def test_wal_sidecars_copied_and_cleaned(self):
+        db = self._make_db()
+        cache = self.tmp / "wal-cache"
+        wal = Path(f"{db}-wal")
+        shm = Path(f"{db}-shm")
+        wal.write_bytes(b"wal-bytes")
+        shm.write_bytes(b"shm-bytes")
+
+        fntv = FntvDb(str(db), cache_dir=cache)
+        fntv._copy_db()
+        self.assertTrue((cache / "trimmedia_tmp.db-wal").exists())
+        self.assertTrue((cache / "trimmedia_tmp.db-shm").exists())
+
+        # 删除源附属文件并强制过期缓存，临时目录内的旧附属文件应被清理
+        wal.unlink()
+        shm.unlink()
+        fntv._last_copy = 0.0
+        fntv._copy_db()
+        self.assertFalse((cache / "trimmedia_tmp.db-wal").exists())
+        self.assertFalse((cache / "trimmedia_tmp.db-shm").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

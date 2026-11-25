@@ -6,6 +6,7 @@ import time
 import logging
 import shutil
 import tempfile
+from contextlib import closing
 from enum import Enum
 from pathlib import Path
 
@@ -45,12 +46,25 @@ class FntvDb:
         self._last_copy = 0.0
 
     def _copy_db(self):
-        """原子级复制数据库到临时文件（60s 缓存）"""
+        """原子级复制数据库到临时文件（60s 缓存，含 WAL 附属文件）"""
         now = time.monotonic()
         if now - self._last_copy < DB_CACHE_SECONDS and self._tmp_path.exists():
             return
         try:
             shutil.copy2(str(self._src_path), str(self._tmp_path))
+            for suffix in ("-wal", "-shm"):
+                src_sidecar = Path(f"{self._src_path}{suffix}")
+                dst_sidecar = Path(f"{self._tmp_path}{suffix}")
+                if src_sidecar.is_file():
+                    try:
+                        shutil.copy2(str(src_sidecar), str(dst_sidecar))
+                    except Exception as e:
+                        logger.debug("复制数据库附属文件失败 %s: %s", src_sidecar.name, e)
+                elif dst_sidecar.exists():
+                    try:
+                        dst_sidecar.unlink()
+                    except OSError:
+                        pass
             self._last_copy = now
             logger.debug("数据库副本已刷新: %s", self._tmp_path)
         except Exception as e:
@@ -96,7 +110,7 @@ class FntvDb:
 
     def get_users(self):
         """获取所有活跃用户列表"""
-        with self.get_conn() as conn:
+        with closing(self.get_conn()) as conn:
             rows = conn.execute(
                 "SELECT guid, username FROM user WHERE status = 1 AND guid != 'default-user-template' ORDER BY username"
             ).fetchall()
@@ -104,7 +118,7 @@ class FntvDb:
 
     def get_new_plays(self, user_guid: str, last_sync: int = 0):
         """获取用户自 last_sync 以来的新增播放记录（含条目信息）"""
-        with self.get_conn() as conn:
+        with closing(self.get_conn()) as conn:
             rows = conn.execute(
                 """SELECT ip.item_guid, ip.user_guid, ip.ts AS position_seconds,
                           ip.watched, ip.update_time AS play_update_time,
@@ -299,8 +313,10 @@ class FntvDb:
             return False, "文件不可读（权限问题）"
         try:
             conn = self.get_conn()
-            conn.execute("SELECT COUNT(*) FROM item").fetchone()
-            conn.close()
+            try:
+                conn.execute("SELECT COUNT(*) FROM item").fetchone()
+            finally:
+                conn.close()
             return True, "OK"
         except Exception as e:
             return False, str(e)

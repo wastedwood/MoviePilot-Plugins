@@ -3,8 +3,11 @@
 import logging
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+import time
+from typing import Optional
 
 try:
     from app.log import logger
@@ -67,7 +70,7 @@ class SyncStore:
         return conn
 
     def _init_db(self):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.executescript(STORE_SCHEMA)
 
     # ── Sync State ──────────────────────────────────
@@ -85,12 +88,12 @@ class SyncStore:
         updates = ", ".join(f"{k}=excluded.{k}" for k in data)
         sql = (f"INSERT INTO sync_state ({cols}) VALUES ({placeholders}) "
                f"ON CONFLICT(user_guid, item_guid) DO UPDATE SET {updates}, last_synced_at=unixepoch()")
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(sql, list(data.values()))
 
     def get_state(self, user_guid: str, item_guid: str) -> dict | None:
         """获取单条同步状态"""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT * FROM sync_state WHERE user_guid=? AND item_guid=?",
                 (user_guid, item_guid)
@@ -99,7 +102,7 @@ class SyncStore:
 
     def get_series_status(self, user_guid: str, series_guid: str, season_number: int) -> str | None:
         """获取某剧某季的当前最高状态"""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             for st in ("done", "doing", "pending"):
                 exists = conn.execute(
                     "SELECT 1 FROM sync_state WHERE user_guid=? AND series_guid=? AND season_number=? AND status=? LIMIT 1",
@@ -111,7 +114,7 @@ class SyncStore:
 
     def get_done_subjects(self, user_guid: str) -> list[dict]:
         """获取本地已记为看过的豆瓣条目，按 subject_id 去重"""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT douban_subject_id, MAX(COALESCE(series_title, '')) AS title
                    FROM sync_state
@@ -124,7 +127,7 @@ class SyncStore:
 
     def get_season_subjects(self, user_guid: str) -> list[dict]:
         """按 (剧集, 季, 豆瓣条目) 汇总已同步的电视剧季，status 取 done 优先"""
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT series_guid, season_number, douban_subject_id,
                           MAX(COALESCE(series_title, '')) AS series_title,
@@ -141,7 +144,7 @@ class SyncStore:
 
     def update_season_subject(self, user_guid: str, series_guid: str, season_number: int,
                               old_subject_id: str, new_subject_id: str, status: str):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """UPDATE sync_state SET douban_subject_id=?, status=?, last_synced_at=unixepoch()
                    WHERE user_guid=? AND series_guid=? AND season_number=? AND douban_subject_id=?
@@ -151,23 +154,27 @@ class SyncStore:
 
     def get_stats(self, user_guid: str) -> dict:
         """获取同步统计"""
-        with self._connect() as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) AS c FROM sync_state WHERE user_guid=?", (user_guid,)
-            ).fetchone()["c"]
-            done = conn.execute(
-                "SELECT COUNT(*) AS c FROM sync_state WHERE user_guid=? AND status='done'", (user_guid,)
-            ).fetchone()["c"]
-            failed = conn.execute(
-                "SELECT COUNT(*) AS c FROM sync_state WHERE user_guid=? AND status='failed'", (user_guid,)
-            ).fetchone()["c"]
-            return {"total": total, "done": done, "failed": failed}
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total,
+                          COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END), 0) AS done,
+                          COALESCE(SUM(CASE WHEN status='doing' THEN 1 ELSE 0 END), 0) AS doing,
+                          COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0) AS failed
+                   FROM sync_state WHERE user_guid=?""",
+                (user_guid,)
+            ).fetchone()
+            return {
+                "total": row["total"],
+                "done": row["done"],
+                "doing": row["doing"],
+                "failed": row["failed"],
+            }
 
     # ── 同步日志 ─────────────────────────────────────
 
     def log_action(self, run_id: str, action: str, item_guid: str = "",
                    series_title: str = "", detail: str = ""):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO sync_log (run_id, action, item_guid, series_title, detail) VALUES (?, ?, ?, ?, ?)",
                 (run_id, action, item_guid, series_title, detail)
@@ -189,14 +196,14 @@ class SyncStore:
                  action: str = "", keyword: str = "") -> list[dict]:
         clause, params = self._log_filters(action, keyword)
         sql = f"SELECT * FROM sync_log{clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(sql, [*params, limit, offset]).fetchall()
             return [dict(r) for r in rows]
 
     def count_logs(self, action: str = "", keyword: str = "") -> int:
         clause, params = self._log_filters(action, keyword)
         sql = f"SELECT COUNT(*) AS c FROM sync_log{clause}"
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(sql, params).fetchone()["c"]
 
     def get_last_sync_time(self) -> int:
@@ -206,21 +213,49 @@ class SyncStore:
         except (TypeError, ValueError):
             return 0
 
+    def record_run_result(self, status: str, message: str, run_at_ms: Optional[int] = None):
+        """记录最近一次同步任务的实际执行时间与结果摘要"""
+        ts = int(time.time() * 1000) if run_at_ms is None else int(run_at_ms)
+        with closing(self._connect()) as conn, conn:
+            for key, val in (
+                ("last_run_at", str(ts)),
+                ("last_run_status", str(status or "")),
+                ("last_run_message", str(message or "")),
+            ):
+                conn.execute(
+                    "INSERT INTO runtime_config (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=unixepoch()",
+                    (key, val),
+                )
+
+    def get_last_run(self) -> dict:
+        """读取最近一次同步任务的实际执行时间、状态和摘要"""
+        cfg = self.get_all_config()
+        try:
+            run_at = int(cfg.get("last_run_at") or 0)
+        except (TypeError, ValueError):
+            run_at = 0
+        return {
+            "last_run_at": run_at,
+            "last_run_status": cfg.get("last_run_status", ""),
+            "last_run_message": cfg.get("last_run_message", ""),
+        }
+
     # ── 运行时配置 ───────────────────────────────────
 
     def get_config(self, key: str, default: str = "") -> str:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT value FROM runtime_config WHERE key=?", (key,)).fetchone()
             return row["value"] if row else default
 
     def set_config(self, key: str, value: str):
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO runtime_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=unixepoch()",
                 (key, value)
             )
 
     def get_all_config(self) -> dict:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute("SELECT key, value FROM runtime_config").fetchall()
             return {r["key"]: r["value"] for r in rows}

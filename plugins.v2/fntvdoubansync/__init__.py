@@ -7,6 +7,7 @@
 
 import datetime
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -35,7 +36,7 @@ class FntvDoubanSync(_PluginBase):
     # 插件图标
     plugin_icon = "fntvdoubansync.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "wastedwood"
     # 作者主页
@@ -52,6 +53,11 @@ class FntvDoubanSync(_PluginBase):
     _store: Optional[SyncStore] = None
     _engine: Optional[SyncEngine] = None
     _sync_thread: Optional[threading.Thread] = None
+
+    def __init__(self):
+        super().__init__()
+        self._sync_lock = threading.Lock()
+        self._syncing = False
 
     # 配置属性
     _enabled: bool = False
@@ -83,12 +89,15 @@ class FntvDoubanSync(_PluginBase):
             threshold = int(config.get("watch_threshold_percent", 90))
         except (TypeError, ValueError):
             threshold = 90
+        raw_db_path = config.get("fntv_db_path", "/fntv-db/trimmedia.db")
+        if raw_db_path is None:
+            raw_db_path = "/fntv-db/trimmedia.db"
         return {
             "enabled": self._as_bool(config.get("enabled"), False),
             "notify": self._as_bool(config.get("notify"), True),
             "onlyonce": self._as_bool(config.get("onlyonce"), False),
             "cron": str(config.get("cron") or "0 3 * * *").strip(),
-            "fntv_db_path": str(config.get("fntv_db_path") or "").strip(),
+            "fntv_db_path": str(raw_db_path).strip(),
             "selected_user": str(config.get("selected_user") or "").strip(),
             "use_cookiecloud": self._as_bool(config.get("use_cookiecloud"), False),
             "douban_cookie": str(config.get("douban_cookie") or "").strip(),
@@ -96,6 +105,18 @@ class FntvDoubanSync(_PluginBase):
             "private": self._as_bool(config.get("private"), True),
             "clean_wish": self._as_bool(config.get("clean_wish"), False),
         }
+
+    @staticmethod
+    def _validate_cron(cron: str) -> Tuple[bool, str]:
+        """校验 5 位 Cron 表达式"""
+        expr = str(cron or "").strip()
+        if not expr:
+            return False, "Cron 表达式不能为空"
+        try:
+            CronTrigger.from_crontab(expr)
+            return True, ""
+        except ValueError as e:
+            return False, str(e)
 
     def _current_config(self) -> dict:
         """当前生效配置（供 API 与命令回显）"""
@@ -172,10 +193,15 @@ class FntvDoubanSync(_PluginBase):
         """注册插件公共服务（CronTrigger 定时同步）"""
         if not self._enabled or not self._cron:
             return []
+        try:
+            trigger = CronTrigger.from_crontab(self._cron)
+        except ValueError as e:
+            logger.error(f"{self.plugin_name}：Cron 表达式无效 ({self._cron})：{e}")
+            return []
         return [{
             "id": f"{self.__class__.__name__}.sync",
             "name": "飞牛影视豆瓣同步",
-            "trigger": CronTrigger.from_crontab(self._cron),
+            "trigger": trigger,
             "func": self.sync,
             "kwargs": {},
         }]
@@ -262,49 +288,81 @@ class FntvDoubanSync(_PluginBase):
         elif self._notify:
             self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
 
-    def _do_sync(self, reply_to: Optional[dict] = None) -> str:
+    def _is_running(self) -> bool:
+        return bool(self._syncing or (self._engine and self._engine.is_running))
+
+    def _record_run_safely(self, status: str, message: str, log_error: bool = False):
+        try:
+            store = self._get_store()
+            if log_error:
+                store.log_action(uuid.uuid4().hex[:12], "sync_error", detail=message)
+            store.record_run_result(status, message)
+        except Exception as e:
+            logger.error(f"{self.plugin_name}：记录运行状态失败：{e}")
+
+    def _do_sync(self, reply_to: Optional[dict] = None, already_locked: bool = False) -> str:
         """执行一次同步，返回人类可读的结果摘要"""
-
-        def _fail(msg: str) -> str:
-            logger.error(f"{self.plugin_name}：{msg}")
-            self._reply_or_notify(self.plugin_name, f"⚠️ {msg}", reply_to)
-            return msg
-
-        if not self._fntv_db_path:
-            return _fail("未配置飞牛影视数据库路径")
-        if not self._selected_user:
-            return _fail("未选择飞牛影视同步用户")
-        cookie, _source = self._get_effective_cookie()
-        if not cookie:
-            return _fail("豆瓣 Cookie 未配置或获取失败")
+        if not already_locked:
+            if not self._sync_lock.acquire(blocking=False):
+                logger.warning("同步正在执行中，本次跳过")
+                return "已有同步任务正在执行，本次跳过"
+            if self._is_running():
+                self._sync_lock.release()
+                logger.warning("同步正在执行中，本次跳过")
+                return "已有同步任务正在执行，本次跳过"
+            self._syncing = True
 
         try:
-            fntv = FntvDb(self._fntv_db_path, self.get_data_path())
-            ok, err = fntv.validate()
-            if not ok:
-                return _fail(f"飞牛影视数据库不可用：{err}")
-        except Exception as e:
-            return _fail(f"飞牛影视数据库不可用：{e}")
+            def _fail(msg: str) -> str:
+                logger.error(f"{self.plugin_name}：{msg}")
+                self._record_run_safely("error", msg, log_error=True)
+                self._reply_or_notify(self.plugin_name, f"⚠️ {msg}", reply_to)
+                return msg
 
-        captured = []
+            if not self._fntv_db_path:
+                return _fail("未配置飞牛影视数据库路径")
+            if not self._selected_user:
+                return _fail("未选择飞牛影视同步用户")
+            cookie, _source = self._get_effective_cookie()
+            if not cookie:
+                return _fail("豆瓣 Cookie 未配置或获取失败")
 
-        def on_summary(title: str, body: str):
-            captured.append((title, body))
-            self._reply_or_notify(title, body, reply_to)
+            try:
+                fntv = FntvDb(self._fntv_db_path, self.get_data_path())
+                ok, err = fntv.validate()
+                if not ok:
+                    return _fail(f"飞牛影视数据库不可用：{err}")
+            except Exception as e:
+                return _fail(f"飞牛影视数据库不可用：{e}")
 
-        engine = SyncEngine(fntv, self._get_store(), cookie,
-                            watch_threshold_percent=self._watch_threshold_percent,
-                            private=self._private,
-                            clean_wish=self._clean_wish,
-                            notify_callback=on_summary)
-        self._engine = engine
-        run_id = engine.run(self._selected_user)
-        if not run_id:
-            logger.warning("同步正在执行中，本次跳过")
-            return "已有同步任务正在执行，本次跳过"
-        if captured:
-            return captured[0][1]
-        return "同步完成，本次无状态变更"
+            captured = []
+
+            def on_summary(title: str, body: str):
+                captured.append((title, body))
+                self._reply_or_notify(title, body, reply_to)
+
+            engine = SyncEngine(fntv, self._get_store(), cookie,
+                                watch_threshold_percent=self._watch_threshold_percent,
+                                private=self._private,
+                                clean_wish=self._clean_wish,
+                                notify_callback=on_summary)
+            self._engine = engine
+            run_id = engine.run(self._selected_user)
+            if not run_id:
+                logger.warning("同步正在执行中，本次跳过")
+                return "已有同步任务正在执行，本次跳过"
+            outcome_status, outcome_msg = engine.last_outcome
+            summary_text = outcome_msg or (captured[0][1] if captured else "同步完成，本次无状态变更")
+            self._record_run_safely(outcome_status, summary_text)
+            if captured:
+                return captured[0][1]
+            return summary_text
+        finally:
+            self._syncing = False
+            self._sync_lock.release()
+
+    def _do_sync_locked_entry(self):
+        self._do_sync(already_locked=True)
 
     # ── 飞牛数据库辅助 ───────────────────────────────
 
@@ -346,21 +404,27 @@ class FntvDoubanSync(_PluginBase):
 
     def api_status(self) -> dict:
         """GET /status：状态与统计概览"""
-        stats = {"total": 0, "done": 0, "failed": 0}
+        stats = {"total": 0, "done": 0, "doing": 0, "failed": 0}
+        last_run = {"last_run_at": 0, "last_run_status": "", "last_run_message": ""}
         try:
             store = self._get_store()
             if self._selected_user:
                 stats = store.get_stats(self._selected_user)
             last_sync_time = store.get_last_sync_time()
+            last_run = store.get_last_run()
         except Exception as e:
             logger.error(f"读取同步状态失败：{e}")
             last_sync_time = 0
         return {
-            "running": bool(self._engine and self._engine.is_running),
+            "running": self._is_running(),
             "enabled": bool(self._enabled),
+            "fntv_db_path": self._fntv_db_path,
             "selected_user": self._selected_user,
             "cookie_source": self._cookie_source_label(),
             "last_sync_time": last_sync_time,
+            "last_run_at": last_run["last_run_at"],
+            "last_run_status": last_run["last_run_status"],
+            "last_run_message": last_run["last_run_message"],
             "stats": stats,
         }
 
@@ -419,11 +483,23 @@ class FntvDoubanSync(_PluginBase):
 
     def api_sync_run(self) -> dict:
         """POST /sync/run：后台线程异步触发一次同步"""
-        if self._engine and self._engine.is_running:
+        if not self._sync_lock.acquire(blocking=False):
             return {"ok": False, "running": True, "message": "同步正在进行中，请稍候"}
-        self._sync_thread = threading.Thread(
-            target=self._do_sync, name=f"{self.__class__.__name__}-sync", daemon=True)
-        self._sync_thread.start()
+        if self._is_running():
+            self._sync_lock.release()
+            return {"ok": False, "running": True, "message": "同步正在进行中，请稍候"}
+        self._syncing = True
+        try:
+            self._sync_thread = threading.Thread(
+                target=self._do_sync_locked_entry,
+                name=f"{self.__class__.__name__}-sync",
+                daemon=True,
+            )
+            self._sync_thread.start()
+        except Exception:
+            self._syncing = False
+            self._sync_lock.release()
+            raise
         return {"ok": True, "running": True, "message": "同步已开始"}
 
     def api_logs(self, limit: int = 50, offset: int = 0,
@@ -445,6 +521,9 @@ class FntvDoubanSync(_PluginBase):
     def api_save_config(self, data: dict) -> dict:
         """POST /config：校验并保存配置"""
         conf = self._normalize_config({**self._current_config(), **(data or {})})
+        ok, err = self._validate_cron(conf["cron"])
+        if not ok:
+            return {"ok": False, "message": f"Cron 表达式无效：{err}"}
         self.update_config(conf)
         self.init_plugin(conf)
         return {"ok": True, "message": "配置已保存并生效"}

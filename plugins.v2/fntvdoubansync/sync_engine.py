@@ -65,10 +65,15 @@ class SyncEngine:
         self._stats = {}
         self._summary_items = {}
         self._retry_plays = []
+        self._last_outcome: tuple[str, str] = ("success", "")
 
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def last_outcome(self) -> tuple[str, str]:
+        return self._last_outcome
 
     # ── 日志帮助方法 ─────────────────────────────────
 
@@ -227,6 +232,7 @@ class SyncEngine:
         if not client.check_auth():
             logger.error("[%s] 豆瓣认证失败，请检查 Cookie", run_id)
             self._log(run_id, "auth_failed", detail="豆瓣 Cookie 无效")
+            self._last_outcome = ("error", "豆瓣 Cookie 已失效，请在插件配置中更新")
             if self._notify_callback:
                 self._notify_callback("飞牛影视豆瓣同步 · Cookie 无效",
                                       "⚠️ 豆瓣 Cookie 已失效，请在插件配置中更新")
@@ -244,6 +250,7 @@ class SyncEngine:
             logger.info("[%s] 无新增播放记录", run_id)
             self._log(run_id, "no_new_records")
             self._store.set_config("last_sync_time", str(int(datetime.now().timestamp() * 1000)))
+            self._last_outcome = ("success", "无新增播放记录")
             return run_id
 
         logger.info("[%s] 发现 %d 条新播放记录", run_id, len(plays))
@@ -267,6 +274,7 @@ class SyncEngine:
         if not plays:
             logger.info("[%s] 过滤后无剩余播放记录", run_id)
             self._log(run_id, "all_filtered", detail="播放进度均为 0")
+            self._last_outcome = ("success", "播放进度均为 0，本次无同步条目")
             return run_id
 
         # 3) 指纹检查：播放记录较上次无变化则跳过豆瓣调用
@@ -275,6 +283,7 @@ class SyncEngine:
         if fp == last_fp:
             logger.info("[%s] 播放记录较上次无变化，跳过豆瓣API调用", run_id)
             self._log(run_id, "no_change_skip", detail="播放记录无变化")
+            self._last_outcome = ("success", "播放记录无变化，已跳过")
             return run_id
 
         # 4) 分组：电影 和 电视剧单集（含智能跨季回退）
@@ -282,60 +291,62 @@ class SyncEngine:
         tv_groups = {}  # {(series_guid, season_number_or_0): {info, plays, is_inferred}}
 
         conn = self._fntv.get_conn()
-        for play in plays:
-            cat = self._fntv.classify_item(conn, play["item_guid"])
+        try:
+            for play in plays:
+                cat = self._fntv.classify_item(conn, play["item_guid"])
 
-            if cat == ItemCategory.MOVIE:
-                movie_plays.append(play)
+                if cat == ItemCategory.MOVIE:
+                    movie_plays.append(play)
 
-            elif cat == ItemCategory.EPISODE:
-                info = self._fntv.get_series_hierarchy(conn, play["item_guid"])
+                elif cat == ItemCategory.EPISODE:
+                    info = self._fntv.get_series_hierarchy(conn, play["item_guid"])
 
-                if info:
-                    # 标准层级成功；第 0 季是特别篇，豆瓣通常无对应条目，搜索会误中第一季
-                    if info["season_number"] == 0:
-                        self._log(run_id, "skip_special", play["item_guid"],
-                                  info["series_title"] or "", "特别篇不同步")
-                        continue
-                    key = (info["series_guid"], info["season_number"] or 0)
-                    tv_groups.setdefault(key, {"info": info, "plays": [], "is_inferred": False})
-                    tv_groups[key]["plays"].append(play)
-
-                else:
-                    # 标准层级失败 → 尝试扁平结构回退
-                    flat = self._fntv.get_series_for_episode_flat(conn, play["item_guid"])
-                    if flat:
-                        ep_num = play.get("episode_number")
-                        inferred = None
-                        if ep_num:
-                            inferred = self._fntv.infer_episode_group(
-                                conn, flat["series_guid"], ep_num)
-
-                        season_num = None
-                        total_eps_override = None
-                        if inferred:
-                            season_num = inferred.get("season_number")
-                            total_eps_override = inferred.get("total_eps")
-                        if not season_num:
-                            season_num = flat.get("season_number") or play.get("season_number")
-
-                        # 构造模拟 info
-                        info = {
-                            "series_guid": flat["series_guid"],
-                            "season_guid": "",  # 无真实 season
-                            "season_number": season_num,
-                            "series_title": flat["series_title"],
-                            "_total_eps_override": total_eps_override,
-                        }
+                    if info:
+                        # 标准层级成功；第 0 季是特别篇，豆瓣通常无对应条目，搜索会误中第一季
+                        if info["season_number"] == 0:
+                            self._log(run_id, "skip_special", play["item_guid"],
+                                      info["series_title"] or "", "特别篇不同步")
+                            continue
                         key = (info["series_guid"], info["season_number"] or 0)
-                        tv_groups.setdefault(key, {"info": info, "plays": [], "is_inferred": True})
+                        tv_groups.setdefault(key, {"info": info, "plays": [], "is_inferred": False})
                         tv_groups[key]["plays"].append(play)
-                        logger.info("[%s] 智能跨季回退: %s ep=%s → 季%s",
-                                    run_id, flat["series_title"], ep_num,
-                                    info["season_number"] or "?")
+
                     else:
-                        logger.warning("[%s] 无法获取条目层级: %s", run_id, play["item_guid"])
-        conn.close()
+                        # 标准层级失败 → 尝试扁平结构回退
+                        flat = self._fntv.get_series_for_episode_flat(conn, play["item_guid"])
+                        if flat:
+                            ep_num = play.get("episode_number")
+                            inferred = None
+                            if ep_num:
+                                inferred = self._fntv.infer_episode_group(
+                                    conn, flat["series_guid"], ep_num)
+
+                            season_num = None
+                            total_eps_override = None
+                            if inferred:
+                                season_num = inferred.get("season_number")
+                                total_eps_override = inferred.get("total_eps")
+                            if not season_num:
+                                season_num = flat.get("season_number") or play.get("season_number")
+
+                            # 构造模拟 info
+                            info = {
+                                "series_guid": flat["series_guid"],
+                                "season_guid": "",  # 无真实 season
+                                "season_number": season_num,
+                                "series_title": flat["series_title"],
+                                "_total_eps_override": total_eps_override,
+                            }
+                            key = (info["series_guid"], info["season_number"] or 0)
+                            tv_groups.setdefault(key, {"info": info, "plays": [], "is_inferred": True})
+                            tv_groups[key]["plays"].append(play)
+                            logger.info("[%s] 智能跨季回退: %s ep=%s → 季%s",
+                                        run_id, flat["series_title"], ep_num,
+                                        info["season_number"] or "?")
+                        else:
+                            logger.warning("[%s] 无法获取条目层级: %s", run_id, play["item_guid"])
+        finally:
+            conn.close()
 
         # 5) 处理电影
         for play in movie_plays:
@@ -356,6 +367,10 @@ class SyncEngine:
                            run_id, len(self._retry_plays))
         self._store.set_config("last_sync_time", str(max_time))
         self._store.set_config("last_play_fingerprint", fp)
+
+        body = self._build_summary_body(self._stats, self._summary_items)
+        outcome_status = "warning" if self._stats["failed"] else "success"
+        self._last_outcome = (outcome_status, body or "同步完成，本次无状态变更")
 
         logger.info("[%s] 同步完成", run_id)
         self._send_summary()
@@ -562,6 +577,7 @@ class SyncEngine:
         if not sid:
             logger.warning("[%s] 豆瓣搜索无结果: %s", run_id, title)
             self._store.upsert_state(user_guid, item_guid, media_type="movie",
+                                     series_title=title,
                                      status="failed",
                                      play_update_time=play["play_update_time"])
             self._log(run_id, "error_search", item_guid, title,
@@ -573,6 +589,7 @@ class SyncEngine:
         if ok:
             self._store.upsert_state(user_guid, item_guid,
                                      media_type="movie", status=interest,
+                                     series_title=title,
                                      douban_subject_id=sid,
                                      play_update_time=play["play_update_time"])
             self._log(run_id, f"mark_{interest}", item_guid, title, f"豆瓣ID={sid}")
@@ -581,6 +598,7 @@ class SyncEngine:
         else:
             self._store.upsert_state(user_guid, item_guid,
                                      media_type="movie", status="failed",
+                                     series_title=title,
                                      play_update_time=play["play_update_time"])
             self._log(run_id, "error_api", item_guid, title,
                       self._failure_detail(client, errors, [play], f"标记失败 sid={sid}"))
@@ -597,22 +615,24 @@ class SyncEngine:
         series_title = info["series_title"] or "未知剧集"
 
         conn = self._fntv.get_conn()
-        # 未达阈值的单集只说明在看，不计入看到第几集
-        played_max = max((p.get("episode_number") or 0 for p in plays
-                          if p.get("_complete", True)), default=0)
+        try:
+            # 未达阈值的单集只说明在看，不计入看到第几集
+            played_max = max((p.get("episode_number") or 0 for p in plays
+                              if p.get("_complete", True)), default=0)
 
-        if is_inferred and info.get("_total_eps_override"):
-            # 扁平回退场景：使用推断的 total_eps
-            total_eps = info["_total_eps_override"]
-            max_watched = played_max
-        elif season_guid:
-            total_eps = self._fntv.get_season_total_episodes(conn, season_guid)
-            max_watched = self._fntv.get_season_max_watched(conn, user_guid, season_guid)
-        else:
-            # 最极端回退：没有 season_guid
-            total_eps = 0
-            max_watched = played_max
-        conn.close()
+            if is_inferred and info.get("_total_eps_override"):
+                # 扁平回退场景：使用推断的 total_eps
+                total_eps = info["_total_eps_override"]
+                max_watched = played_max
+            elif season_guid:
+                total_eps = self._fntv.get_season_total_episodes(conn, season_guid)
+                max_watched = self._fntv.get_season_max_watched(conn, user_guid, season_guid)
+            else:
+                # 最极端回退：没有 season_guid
+                total_eps = 0
+                max_watched = played_max
+        finally:
+            conn.close()
 
         current_status = self._store.get_series_status(user_guid, series_guid,
                                                        season_number or 0)

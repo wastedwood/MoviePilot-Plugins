@@ -519,7 +519,13 @@ class DoubanClient:
                 headers["Cookie"] = self._make_cookie_header()
                 continue
             if resp.status_code == 200:
-                return self._parse_mark_response(resp.json())
+                try:
+                    data_json = resp.json()
+                except ValueError:
+                    logger.warning("豆瓣标记响应不是 JSON: %s", resp.text[:200])
+                    self._note_unavailable()
+                    return False
+                return self._parse_mark_response(data_json)
             logger.error("豆瓣标记失败 [%d]: %s", resp.status_code, resp.text[:200])
             self._note_unavailable(resp.status_code)
             return False

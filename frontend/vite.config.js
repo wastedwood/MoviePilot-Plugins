@@ -4,7 +4,32 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import federation from '@originjs/vite-plugin-federation'
 
-export default defineConfig({
+const charsetRemovalPlugin = {
+  postcssPlugin: 'internal:charset-removal',
+  AtRule: {
+    charset: (atRule) => {
+      if (atRule.name === 'charset') {
+        atRule.remove()
+      }
+    },
+  },
+}
+
+const vuetifyFilterPlugin = {
+  // 构建联邦产物时过滤所有 vuetify 全局规则，避免污染宿主页面样式
+  postcssPlugin: 'vuetify-filter',
+  Root(root) {
+    root.walkRules(rule => {
+      if (rule.selector && (
+          rule.selector.includes('.v-') ||
+          rule.selector.includes('.mdi-'))) {
+        rule.remove()
+      }
+    })
+  },
+}
+
+export default defineConfig(({ command }) => ({
   plugins: [
     vue(),
     federation({
@@ -40,31 +65,9 @@ export default defineConfig({
   },
   css: {
     postcss: {
-      plugins: [
-        {
-          postcssPlugin: 'internal:charset-removal',
-          AtRule: {
-            charset: (atRule) => {
-              if (atRule.name === 'charset') {
-                atRule.remove()
-              }
-            },
-          },
-        },
-        {
-          // 过滤所有 vuetify 全局规则，避免污染宿主页面样式
-          postcssPlugin: 'vuetify-filter',
-          Root(root) {
-            root.walkRules(rule => {
-              if (rule.selector && (
-                  rule.selector.includes('.v-') ||
-                  rule.selector.includes('.mdi-'))) {
-                rule.remove()
-              }
-            })
-          },
-        },
-      ],
+      plugins: command === 'build'
+        ? [charsetRemovalPlugin, vuetifyFilterPlugin]
+        : [charsetRemovalPlugin],
     },
   },
   server: {
@@ -72,4 +75,4 @@ export default defineConfig({
     cors: true,
     origin: 'http://localhost:5001',
   },
-})
+}))
