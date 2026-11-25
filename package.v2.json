@@ -3,12 +3,13 @@
     "name": "飞牛影视豆瓣同步",
     "description": "只读解析飞牛影视（FNTV）观看记录，增量同步电影与剧集的在看/看过状态到豆瓣。",
     "labels": "豆瓣,飞牛影视,同步",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "icon": "https://raw.githubusercontent.com/wastedwood/MoviePilot-Plugins/main/icons/fntvdoubansync.png",
     "author": "wastedwood",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.1.1": "修复第三方插件已安装列表图标无法加载（补全图标完整 URL），并在插件加载配置时写入初始运行日志避免日志视图 404。",
       "v1.1.0": "全面重构优化：重绘插件图标、修复前端交互与视觉排版、完善挂载指引、强化后端并发锁/WAL兼容/失败可观测性。",
       "v1.0.0": "从 DouBanSync 迁移为 MoviePilot 2.0 插件：Vue 联邦界面、定时同步、CookieCloud 自动获取与原生消息通知。"
     }

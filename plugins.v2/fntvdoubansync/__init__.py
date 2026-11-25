@@ -34,9 +34,9 @@ class FntvDoubanSync(_PluginBase):
     # 插件描述
     plugin_desc = "只读解析飞牛影视（FNTV）观看记录，增量同步电影与剧集的在看/看过状态到豆瓣。"
     # 插件图标
-    plugin_icon = "fntvdoubansync.png"
+    plugin_icon = "https://raw.githubusercontent.com/wastedwood/MoviePilot-Plugins/main/icons/fntvdoubansync.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "wastedwood"
     # 作者主页
@@ -154,6 +154,9 @@ class FntvDoubanSync(_PluginBase):
             self._watch_threshold_percent = conf["watch_threshold_percent"]
             self._private = conf["private"]
             self._clean_wish = conf["clean_wish"]
+            logger.info(
+                f"{self.plugin_name}：配置已加载（启用={self._enabled}，周期={self._cron}，Cookie来源={self._cookie_source_label()}）"
+            )
 
         # 立即运行一次
         if self._onlyonce:

@@ -132,6 +132,10 @@ class PluginConfigTests(unittest.TestCase):
         self.assertEqual(render_mode, "vue")
         self.assertEqual(dist_path, "dist/assets")
 
+    def test_plugin_icon_uses_full_raw_url(self):
+        self.assertTrue(self.plugin.plugin_icon.startswith("https://raw.githubusercontent.com/"))
+        self.assertTrue(self.plugin.plugin_icon.endswith("/icons/fntvdoubansync.png"))
+
 
 # ── Cookie 解析优先级 ───────────────────────────────
 
