@@ -24,6 +24,7 @@ SEASON_LABELS = {1: "第一季", 2: "第二季", 3: "第三季", 4: "第四季",
 SUMMARY_ACTIONS = {
     "mark_done": ("done", ""),
     "mark_doing": ("doing", ""),
+    "remove_doing": ("removed", "飞牛库已删除"),
     "error_search": ("failed", "豆瓣搜索无结果"),
     "error_api": ("failed", "豆瓣标记失败"),
     "skip_done": ("skipped", "此前已同步"),
@@ -33,6 +34,7 @@ SUMMARY_ACTIONS = {
 SUMMARY_SECTIONS = (
     ("done", "✅ 已看完"),
     ("doing", "▶️ 在看"),
+    ("removed", "🗑️ 移出在看"),
     ("failed", "❌ 失败"),
     ("skipped", "⏭️ 跳过"),
 )
@@ -221,9 +223,20 @@ class SyncEngine:
             self._running = False
             self._lock.release()
 
+    def _finalize_early_exit(self, default_msg: str):
+        """无新增播放可处理时，若在看整理产生了变更则发送摘要并更新运行结论"""
+        if (self._stats.get("done") or self._stats.get("doing")
+                or self._stats.get("removed") or self._stats.get("failed")):
+            body = self._build_summary_body(self._stats, self._summary_items)
+            outcome_status = "warning" if self._stats.get("failed") else "success"
+            self._last_outcome = (outcome_status, body)
+            self._send_summary()
+        else:
+            self._last_outcome = ("success", default_msg)
+
     def _do_run(self, user_guid: str) -> str:
         run_id = uuid.uuid4().hex[:12]
-        self._stats = {"done": 0, "doing": 0, "failed": 0, "skipped": 0}
+        self._stats = {"done": 0, "doing": 0, "failed": 0, "skipped": 0, "removed": 0}
         self._retry_plays = []
         self._summary_items = {key: [] for key, _ in SUMMARY_SECTIONS}
         logger.info("[%s] 同步开始 user=%s", run_id, user_guid)
@@ -243,6 +256,7 @@ class SyncEngine:
         self._repair_legacy_done(run_id, client, user_guid)
         self._repair_season_subjects(run_id, client, user_guid)
         self._clean_wish_list(run_id, client)
+        self._reconcile_doing_items(run_id, client, user_guid)
 
         last_sync = int(self._store.get_config("last_sync_time", "0"))
         plays = self._fntv.get_new_plays(user_guid, last_sync)
@@ -250,7 +264,7 @@ class SyncEngine:
             logger.info("[%s] 无新增播放记录", run_id)
             self._log(run_id, "no_new_records")
             self._store.set_config("last_sync_time", str(int(datetime.now().timestamp() * 1000)))
-            self._last_outcome = ("success", "无新增播放记录")
+            self._finalize_early_exit("无新增播放记录")
             return run_id
 
         logger.info("[%s] 发现 %d 条新播放记录", run_id, len(plays))
@@ -274,7 +288,7 @@ class SyncEngine:
         if not plays:
             logger.info("[%s] 过滤后无剩余播放记录", run_id)
             self._log(run_id, "all_filtered", detail="播放进度均为 0")
-            self._last_outcome = ("success", "播放进度均为 0，本次无同步条目")
+            self._finalize_early_exit("播放进度均为 0，本次无同步条目")
             return run_id
 
         # 3) 指纹检查：播放记录较上次无变化则跳过豆瓣调用
@@ -283,7 +297,7 @@ class SyncEngine:
         if fp == last_fp:
             logger.info("[%s] 播放记录较上次无变化，跳过豆瓣API调用", run_id)
             self._log(run_id, "no_change_skip", detail="播放记录无变化")
-            self._last_outcome = ("success", "播放记录无变化，已跳过")
+            self._finalize_early_exit("播放记录无变化，已跳过")
             return run_id
 
         # 4) 分组：电影 和 电视剧单集（含智能跨季回退）
@@ -508,6 +522,121 @@ class SyncEngine:
                 self._log(run_id, "error_api", wish["sid"], title, "移出想看失败")
         logger.info("[%s] 想看清理完成: 想看=%d 移出=%d", run_id, len(wishes), removed)
 
+    def _reconcile_doing_items(self, run_id: str, client: DoubanClient, user_guid: str):
+        """整理本地在看条目：
+        1. 仍存在于飞牛有效库中的剧集季，若正片总集数更新后已满足看完条件，自动升级为看过；
+        2. 已从飞牛有效库删除的条目，清理豆瓣「在看」标记并移除本地失效记录。
+        """
+        doing_seasons = self._store.get_doing_seasons(user_guid)
+        doing_movies = self._store.get_doing_movies(user_guid)
+        if not doing_seasons and not doing_movies:
+            return
+
+        conn = self._fntv.get_conn()
+        try:
+            # 1) 有效库中的在看剧集：按正片集数重新核对是否已看完
+            for s in doing_seasons:
+                series_guid = s["series_guid"]
+                season_number = s["season_number"]
+                series_title = s["series_title"] or "未知剧集"
+                if not self._fntv.is_item_active(conn, series_guid):
+                    continue
+                season_row = self._fntv.get_season(conn, series_guid, season_number)
+                if not isinstance(season_row, dict) or not season_row.get("guid"):
+                    continue
+                total_eps = self._fntv.get_season_total_episodes(conn, season_row["guid"])
+                live_watched = self._fntv.get_season_max_watched(conn, user_guid, season_row["guid"])
+                if not isinstance(total_eps, int) or not isinstance(live_watched, int):
+                    continue
+                max_watched = max(s["max_ep_watched"] or 0, live_watched)
+                if total_eps <= 0 or max_watched < total_eps:
+                    continue
+
+                parts = self._season_parts(
+                    client, series_title, season_number, season_row.get("title", ""), total_eps
+                )
+                if not parts and s["douban_subject_id"]:
+                    parts = [(s["douban_subject_id"], 0)]
+                if not parts:
+                    continue
+
+                marked = self._mark_season(client, parts, "done", max_watched)
+                if marked:
+                    self._store.mark_season_done(
+                        user_guid, series_guid, season_number, parts[0][0], max_watched, total_eps
+                    )
+                    self._log(
+                        run_id, "mark_done", series_guid, series_title,
+                        f"豆瓣ID={','.join(marked)} ep={max_watched}/{total_eps}",
+                    )
+                    self._stats["done"] += 1
+                else:
+                    self._log(run_id, "error_api", series_guid, series_title,
+                              f"升级看过失败 sid={parts[0][0]}")
+                    self._stats["failed"] += 1
+
+            # 2) 已从飞牛库删除的在看条目：移除豆瓣「在看」
+            remaining_movies = self._store.get_doing_movies(user_guid)
+            remaining_seasons = self._store.get_doing_seasons(user_guid)
+            inactive_movies = [m for m in remaining_movies if not self._fntv.is_item_active(conn, m["item_guid"])]
+            inactive_seasons = [s for s in remaining_seasons if not self._fntv.is_item_active(conn, s["series_guid"])]
+        finally:
+            conn.close()
+
+        if not inactive_movies and not inactive_seasons:
+            return
+
+        exclude_guids = {m["item_guid"] for m in inactive_movies} | {s["series_guid"] for s in inactive_seasons}
+        protected_sids = self._store.get_protected_subject_ids(user_guid, exclude_guids)
+        checked_sids: dict[str, bool] = {}
+
+        def _clear_deleted_entry(guid: str, title: str, stored_sid: str) -> bool:
+            sids = []
+            if stored_sid:
+                sids.append(stored_sid)
+            for sid in self._store.get_doing_log_subjects(guid):
+                if sid not in sids:
+                    sids.append(sid)
+
+            failed = False
+            for sid in sids:
+                if sid in protected_sids:
+                    continue
+                if sid in checked_sids:
+                    if not checked_sids[sid]:
+                        failed = True
+                    continue
+                errors_before = client.error_count
+                actual = client.get_interest_status(sid)
+                if actual is None:
+                    if client.error_count > errors_before:
+                        checked_sids[sid] = False
+                        failed = True
+                    else:
+                        checked_sids[sid] = True
+                    continue
+                if actual != "do":
+                    checked_sids[sid] = True
+                    continue
+                if client.remove_interest(sid):
+                    checked_sids[sid] = True
+                    self._log(run_id, "remove_doing", guid, title, f"飞牛库已删除，移出在看 sid={sid}")
+                    self._stats["removed"] += 1
+                else:
+                    checked_sids[sid] = False
+                    failed = True
+                    self._log(run_id, "error_api", guid, title, f"移出在看失败 sid={sid}")
+                    self._stats["failed"] += 1
+            return not failed
+
+        for m in inactive_movies:
+            if _clear_deleted_entry(m["item_guid"], m["series_title"] or "未知片名", m["douban_subject_id"]):
+                self._store.delete_item_doing_state(user_guid, m["item_guid"])
+
+        for s in inactive_seasons:
+            if _clear_deleted_entry(s["series_guid"], s["series_title"] or "未知剧集", s["douban_subject_id"]):
+                self._store.delete_season_doing_state(user_guid, s["series_guid"], s["season_number"])
+
     # ── 通知 ────────────────────────────────────────
 
     @staticmethod
@@ -536,7 +665,7 @@ class SyncEngine:
             return
         if self._stats["failed"]:
             title = "飞牛影视豆瓣同步 · 同步有异常"
-        elif self._stats["done"] or self._stats["doing"]:
+        elif self._stats["done"] or self._stats["doing"] or self._stats.get("removed"):
             title = "飞牛影视豆瓣同步 · 同步完成"
         else:
             return  # 无状态变更、无失败，不推送
@@ -569,6 +698,17 @@ class SyncEngine:
             self._log(run_id, "skip_done", item_guid, title, "电影已标记在看")
             self._stats["skipped"] += 1
             return
+
+        if interest == "doing":
+            conn = self._fntv.get_conn()
+            try:
+                is_active = self._fntv.is_item_active(conn, item_guid)
+            finally:
+                conn.close()
+            if not is_active:
+                self._log(run_id, "skip_deleted", item_guid, title, "已从飞牛库删除，不标记在看")
+                self._stats["skipped"] += 1
+                return
 
         errors = client.error_count
         sid = state.get("douban_subject_id") if state else None
@@ -616,6 +756,7 @@ class SyncEngine:
 
         conn = self._fntv.get_conn()
         try:
+            is_active = self._fntv.is_item_active(conn, series_guid)
             # 未达阈值的单集只说明在看，不计入看到第几集
             played_max = max((p.get("episode_number") or 0 for p in plays
                               if p.get("_complete", True)), default=0)
@@ -640,6 +781,13 @@ class SyncEngine:
         # 幂等：已完成则跳过
         if current_status == "done":
             self._log(run_id, "skip_done", series_guid, series_title, "已标记看过")
+            self._stats["skipped"] += 1
+            return
+
+        # 决定目标状态前，先检查已从飞牛库删除的剧集是否仍需标记「在看」
+        is_complete_preview = total_eps > 0 and max(max_watched, played_max) >= total_eps
+        if not is_active and current_status in (None, "pending") and not is_complete_preview:
+            self._log(run_id, "skip_deleted", series_guid, series_title, "已从飞牛库删除，不标记在看")
             self._stats["skipped"] += 1
             return
 

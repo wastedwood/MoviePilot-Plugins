@@ -479,7 +479,7 @@ class DoubanClient:
         return m.group(1) if m else ""
 
     def remove_interest(self, subject_id: str) -> bool:
-        """删除条目的标记（条目页「删除这个收藏」），并核对已不再是想看"""
+        """删除条目的标记（条目页「删除这个收藏」），并核对收藏已删除"""
         url = f"https://movie.douban.com/subject/{subject_id}/remove"
         headers = self._subject_headers(subject_id)
         for attempt in range(2):
@@ -499,8 +499,8 @@ class DoubanClient:
             logger.error("删除豆瓣标记失败 [%d] sid=%s", resp.status_code, subject_id)
             return False
         actual = self.get_interest_status(subject_id)
-        if actual == "wish":
-            logger.error("豆瓣标记未删除 sid=%s", subject_id)
+        if actual in ("wish", "do", "collect"):
+            logger.error("豆瓣标记未删除 sid=%s actual=%s", subject_id, actual)
             return False
         return True
 

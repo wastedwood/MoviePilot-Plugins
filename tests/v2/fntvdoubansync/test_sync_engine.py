@@ -1,8 +1,10 @@
+import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
-from app.plugins.fntvdoubansync.fntv_db import ItemCategory
+from app.plugins.fntvdoubansync.fntv_db import FntvDb, ItemCategory
 from app.plugins.fntvdoubansync.sync_engine import SyncEngine
 from app.plugins.fntvdoubansync.sync_store import SyncStore
 
@@ -520,6 +522,158 @@ class WishCleanupTests(unittest.TestCase):
         client.remove_interest.assert_called_once_with("26389148")
         store.log_action.assert_called_once_with("run", "remove_wish", "26389148", "赴汤蹈火",
                                                  "飞牛库已有「赴汤蹈火」")
+
+
+class DoingReconciliationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = Path(self._tmp.name)
+        self.db_path = self.tmp / "trimmedia.db"
+        self.store = SyncStore(str(self.tmp))
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.executescript("""
+            CREATE TABLE user (guid TEXT PRIMARY KEY, username TEXT, status INTEGER);
+            CREATE TABLE item (
+                guid TEXT PRIMARY KEY, parent_guid TEXT, season_number INTEGER,
+                episode_number INTEGER, title TEXT, original_title TEXT,
+                runtime INTEGER, imdb_id TEXT
+            );
+            CREATE TABLE item_user_play (
+                item_guid TEXT, user_guid TEXT, ts REAL, watched INTEGER,
+                visible INTEGER, update_time INTEGER
+            );
+            CREATE TABLE mediadb_config (item_guid TEXT PRIMARY KEY);
+            CREATE TABLE item_ancestor (item_guid TEXT, ancestor_guid TEXT);
+            INSERT INTO user VALUES ('u', '测试用户', 1);
+            INSERT INTO mediadb_config VALUES ('db-active');
+        """)
+        # 1) 有效库：马大帅（27 正片 + 2 个 -1 花絮，曾被误算成 29 集而停在 doing）
+        conn.executemany(
+            "INSERT INTO item VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("mds-active", "", 0, 0, "马大帅", "", 0, ""),
+                ("mds-active-s1", "mds-active", 1, 27, "马大帅", "", 0, ""),
+                ("mds-extra-1", "mds-active-s1", 1, -1, "花絮1", "", 0, ""),
+                ("mds-extra-2", "mds-active-s1", 1, -1, "花絮2", "", 0, ""),
+            ]
+            + [(f"mds-ep-{i}", "mds-active-s1", 1, i, f"第{i}集", "", 45, "") for i in range(1, 28)],
+        )
+        conn.execute("INSERT INTO item_ancestor VALUES ('mds-active', 'db-active')")
+        conn.execute("INSERT INTO item_user_play VALUES ('mds-ep-27', 'u', 2700, 1, 1, 500)")
+
+        # 2) 失效旧库：金田一（已从飞牛删掉）、死神（分段剧集）、马大帅旧副本（共用 2997297）、已删未看完电影
+        conn.executemany(
+            "INSERT INTO item VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("kindaichi", "", 0, 0, "金田一少年事件簿", "", 0, ""),
+                ("bleach", "", 0, 0, "死神", "", 0, ""),
+                ("mds-old", "", 0, 0, "马大帅", "", 0, ""),
+                ("deleted-movie", "", 0, 0, "已删电影", "", 120, ""),
+                ("deleted-done-movie", "", 0, 0, "已删看完电影", "", 120, ""),
+            ],
+        )
+        for g in ("kindaichi", "bleach", "mds-old", "deleted-movie", "deleted-done-movie"):
+            conn.execute("INSERT INTO item_ancestor VALUES (?, 'db-old')", (g,))
+        conn.commit()
+        conn.close()
+
+        self.fntv = FntvDb(str(self.db_path), cache_dir=self.tmp / "cache")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_upgrades_active_doing_and_cleans_deleted_doing(self):
+        # 预置历史在看记录，游标已超过旧播放，模拟“无新增播放”触发整理
+        self.store.set_config("last_sync_time", "1000")
+        self.store.upsert_state(
+            "u", "mds-ep-27", media_type="episode", series_guid="mds-active",
+            season_number=1, series_title="马大帅", status="doing",
+            douban_subject_id="2997297", episode_number=27,
+            max_ep_watched=27, total_episodes=29, play_update_time=500,
+        )
+        self.store.upsert_state(
+            "u", "kindaichi-ep-7", media_type="episode", series_guid="kindaichi",
+            season_number=1, series_title="金田一少年事件簿", status="doing",
+            douban_subject_id="1818263", episode_number=7,
+            max_ep_watched=7, total_episodes=10, play_update_time=500,
+        )
+        self.store.upsert_state(
+            "u", "bleach-ep-14", media_type="episode", series_guid="bleach",
+            season_number=2, series_title="死神", status="doing",
+            douban_subject_id="35001432", episode_number=14,
+            max_ep_watched=14, total_episodes=40, play_update_time=500,
+        )
+        self.store.log_action(
+            "old-run", "mark_doing", "bleach", "死神",
+            "豆瓣ID=35001432(done),36189163(doing) ep=14/40",
+        )
+        self.store.upsert_state(
+            "u", "mds-old-ep-15", media_type="episode", series_guid="mds-old",
+            season_number=1, series_title="马大帅", status="doing",
+            douban_subject_id="2997297", episode_number=15,
+            max_ep_watched=15, total_episodes=29, play_update_time=500,
+        )
+
+        notified = []
+        with patch("app.plugins.fntvdoubansync.sync_engine.DoubanClient") as client_cls:
+            client = client_cls.return_value
+            client.check_auth.return_value = True
+            client.error_count = 0
+            client.search_subject.return_value = (None, None)
+            client.mark_interest.return_value = True
+            client.get_interest_status.side_effect = {
+                "1818263": "do",
+                "35001432": "collect",
+                "36189163": "do",
+            }.get
+            client.remove_interest.return_value = True
+
+            engine = SyncEngine(
+                self.fntv, self.store, "ck=x",
+                notify_callback=lambda t, b: notified.append((t, b)),
+            )
+            engine.run("u")
+
+        # 1. 马大帅有效副本升级为看过
+        client.mark_interest.assert_called_once_with("2997297", "done", True)
+        self.assertEqual(self.store.get_state("u", "mds-ep-27")["status"], "done")
+        # 2. 金田一、死神Part.2 移出豆瓣在看；死神Part.1(collect) 与 马大帅(2997297已升级done) 受保护
+        removed = [c.args[0] for c in client.remove_interest.call_args_list]
+        self.assertCountEqual(removed, ["1818263", "36189163"])
+        self.assertIsNone(self.store.get_state("u", "kindaichi-ep-7"))
+        self.assertIsNone(self.store.get_state("u", "bleach-ep-14"))
+        self.assertIsNone(self.store.get_state("u", "mds-old-ep-15"))
+        # 3. 无新增播放时也推送了整理摘要
+        self.assertEqual(len(notified), 1)
+        self.assertIn("已看完", notified[0][1])
+        self.assertIn("移出在看", notified[0][1])
+
+    def test_new_partial_play_of_deleted_item_skips_doing_but_completed_syncs(self):
+        self.store.set_config("last_sync_time", "1000")
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("INSERT INTO item_user_play VALUES ('deleted-movie', 'u', 1800, 0, 1, 2000)")
+        conn.execute("INSERT INTO item_user_play VALUES ('deleted-done-movie', 'u', 7000, 1, 1, 2100)")
+        conn.commit()
+        conn.close()
+
+        with patch("app.plugins.fntvdoubansync.sync_engine.DoubanClient") as client_cls:
+            client = client_cls.return_value
+            client.check_auth.return_value = True
+            client.error_count = 0
+            client.search_subject.return_value = ("已删看完电影", "999")
+            client.mark_interest.return_value = True
+
+            engine = SyncEngine(self.fntv, self.store, "ck=x", watch_threshold_percent=90)
+            engine.run("u")
+
+        # 未看完的已删电影不标记在看，已看完的仍同步看过
+        client.mark_interest.assert_called_once_with("999", "done", True)
+        self.assertIsNone(self.store.get_state("u", "deleted-movie"))
+        self.assertEqual(self.store.get_state("u", "deleted-done-movie")["status"], "done")
+        logs = self.store.get_logs(action="skip_deleted")
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["series_title"], "已删电影")
 
 
 if __name__ == "__main__":

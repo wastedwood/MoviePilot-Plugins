@@ -273,6 +273,18 @@ class WishListTests(unittest.TestCase):
         get.return_value.json.return_value = {}
         self.assertTrue(client.remove_interest("123"))
 
+    @patch("app.plugins.fntvdoubansync.douban_client.requests.get")
+    @patch("app.plugins.fntvdoubansync.douban_client.requests.post")
+    def test_remove_interest_verifies_do_is_gone(self, post, get):
+        post.return_value = Mock(status_code=302)
+        get.return_value = Mock(status_code=200)
+        get.return_value.json.return_value = {"interest_status": "do"}
+        client = DoubanClient("ck=test; dbcl2=login")
+        self.assertFalse(client.remove_interest("456"))
+
+        get.return_value.json.return_value = {}
+        self.assertTrue(client.remove_interest("456"))
+
     @patch("app.plugins.fntvdoubansync.douban_client.requests.post")
     def test_post_non_json_200_marks_unavailable(self, post):
         resp = Mock(status_code=200, text="<html>captcha</html>")

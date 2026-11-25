@@ -191,7 +191,7 @@ class FntvDb:
     def get_all_series_episodes(self, conn, series_guid: str) -> list[dict]:
         """获取某系列所有剧集的 episode_number（用于模式检测）"""
         rows = conn.execute(
-            "SELECT guid, episode_number FROM item WHERE parent_guid = ? AND episode_number IS NOT NULL ORDER BY episode_number",
+            "SELECT guid, episode_number FROM item WHERE parent_guid = ? AND episode_number > 0 ORDER BY episode_number",
             (series_guid,)
         ).fetchall()
         return [dict(r) for r in rows]
@@ -244,16 +244,47 @@ class FntvDb:
                 return {"season_number": g["season_number"], "total_eps": g["total_eps"]}
         return None
 
-    # ── 季度查询 ──────────────────────────────────────────
+    # ── 季度与媒体库查询 ──────────────────────────────────
+
+    @staticmethod
+    def _has_active_mediadb(conn) -> bool:
+        """检查数据库中是否存在有效的媒体库配置表"""
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('item_ancestor', 'mediadb_config')"
+            ).fetchall()
+        }
+        if tables != {"item_ancestor", "mediadb_config"}:
+            return False
+        return bool(conn.execute("SELECT 1 FROM mediadb_config LIMIT 1").fetchone())
+
+    def is_item_active(self, conn, item_guid: str) -> bool:
+        """判断条目是否仍在飞牛当前有效媒体库中（已删除或失效旧库返回 False）"""
+        if not item_guid:
+            return False
+        if not conn.execute("SELECT 1 FROM item WHERE guid = ?", (item_guid,)).fetchone():
+            return False
+        if not self._has_active_mediadb(conn):
+            return True
+        return bool(
+            conn.execute(
+                "SELECT 1 FROM item_ancestor ia "
+                "JOIN mediadb_config mc ON ia.ancestor_guid = mc.item_guid "
+                "WHERE ia.item_guid = ? LIMIT 1",
+                (item_guid,),
+            ).fetchone()
+        )
 
     def get_season_total_episodes(self, conn, season_guid: str) -> int:
-        """获取某季的总集数：本地已入库集数与刮削到的计划集数取大
+        """获取某季的总集数：本地正片集数（episode_number > 0）与刮削到的计划集数取大
 
-        连载中的季本地只有已播出的几集，只按入库集数算会把追更中的季误判为看完。
+        连载中的季本地只有已播出的几集，只按入库集数算会把追更中的季误判为看完；
+        过滤 episode_number <= 0，避免花絮或未识别文件虚增总集数。
         """
         row = conn.execute(
             """SELECT MAX(
-                   (SELECT COUNT(*) FROM item WHERE parent_guid = :guid AND episode_number IS NOT NULL),
+                   (SELECT COUNT(*) FROM item WHERE parent_guid = :guid AND episode_number > 0),
                    COALESCE((SELECT episode_number FROM item WHERE guid = :guid), 0)) AS c""",
             {"guid": season_guid}
         ).fetchone()
@@ -272,12 +303,26 @@ class FntvDb:
 
     def get_library_titles(self, conn) -> list[dict]:
         """库中所有电影 / 剧集：{title, original_title, imdb_id, seasons}，seasons 为挂有单集的季号集合"""
-        rows = conn.execute(
-            """SELECT item.guid, COALESCE(item.title, '') AS title,
-                      COALESCE(item.original_title, '') AS original_title,
-                      COALESCE(item.imdb_id, '') AS imdb_id
-               FROM item WHERE item.parent_guid IS NULL OR item.parent_guid = ''"""
-        ).fetchall()
+        if self._has_active_mediadb(conn):
+            rows = conn.execute(
+                """SELECT item.guid, COALESCE(item.title, '') AS title,
+                          COALESCE(item.original_title, '') AS original_title,
+                          COALESCE(item.imdb_id, '') AS imdb_id
+                   FROM item
+                   WHERE (item.parent_guid IS NULL OR item.parent_guid = '')
+                     AND EXISTS (
+                         SELECT 1 FROM item_ancestor ia
+                         JOIN mediadb_config mc ON ia.ancestor_guid = mc.item_guid
+                         WHERE ia.item_guid = item.guid
+                     )"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT item.guid, COALESCE(item.title, '') AS title,
+                          COALESCE(item.original_title, '') AS original_title,
+                          COALESCE(item.imdb_id, '') AS imdb_id
+                   FROM item WHERE item.parent_guid IS NULL OR item.parent_guid = ''"""
+            ).fetchall()
         seasons = {}
         for row in conn.execute(
             """SELECT season.parent_guid, season.season_number FROM item AS season

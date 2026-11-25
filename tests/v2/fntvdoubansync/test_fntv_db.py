@@ -128,6 +128,37 @@ class ItemClassificationTests(unittest.TestCase):
         # 本地集数多于计划集数时以本地为准
         self.assertEqual(fntv.get_season_total_episodes(self.conn, "mds-1"), 29)
 
+    def test_season_total_ignores_non_positive_episodes(self):
+        rows = [
+            ("mds-1", "mds", 1, 27, "马大帅"),
+            ("mds-extra-1", "mds-1", 1, -1, "花絮"),
+            ("mds-extra-2", "mds-1", 1, 0, "预告"),
+        ] + [(f"mds-ep-{i}", "mds-1", 1, i, "") for i in range(1, 28)]
+        self.conn.executemany("INSERT INTO item VALUES (?, ?, ?, ?, ?)", rows)
+
+        fntv = FntvDb.__new__(FntvDb)
+        self.assertEqual(fntv.get_season_total_episodes(self.conn, "mds-1"), 27)
+
+    def test_is_item_active_respects_mediadb_config(self):
+        self.conn.executemany(
+            "INSERT INTO item VALUES (?, ?, ?, ?, ?)",
+            [("active-tv", "", 0, 0, "有效剧"), ("deleted-tv", "", 0, 0, "已删剧")],
+        )
+        fntv = FntvDb.__new__(FntvDb)
+        # 无 mediadb_config 表时默认认为有效（兼容轻量测试库）
+        self.assertTrue(fntv.is_item_active(self.conn, "active-tv"))
+        self.assertFalse(fntv.is_item_active(self.conn, "missing"))
+
+        self.conn.executescript("""
+            CREATE TABLE mediadb_config (item_guid TEXT PRIMARY KEY);
+            CREATE TABLE item_ancestor (item_guid TEXT, ancestor_guid TEXT);
+            INSERT INTO mediadb_config VALUES ('db-active');
+            INSERT INTO item_ancestor VALUES ('active-tv', 'db-active');
+            INSERT INTO item_ancestor VALUES ('deleted-tv', 'db-old');
+        """)
+        self.assertTrue(fntv.is_item_active(self.conn, "active-tv"))
+        self.assertFalse(fntv.is_item_active(self.conn, "deleted-tv"))
+
 
 class FntvDbPathTests(unittest.TestCase):
     """validate 误判提示与临时副本路径隔离"""

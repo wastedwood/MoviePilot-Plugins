@@ -109,6 +109,8 @@ const actionLabels = {
   sync_error: '同步失败',
   auth_failed: 'Cookie 无效',
   remove_wish: '移出想看',
+  remove_doing: '移出在看',
+  skip_deleted: '跳过已删除',
   repair_subject: '修正条目',
 }
 

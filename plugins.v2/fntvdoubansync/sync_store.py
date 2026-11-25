@@ -1,6 +1,7 @@
 """同步状态持久化层——基于 SQLite 的去重、状态追踪、日志"""
 
 import logging
+import re
 import sqlite3
 import uuid
 from contextlib import closing
@@ -150,6 +151,110 @@ class SyncStore:
                    WHERE user_guid=? AND series_guid=? AND season_number=? AND douban_subject_id=?
                      AND status IN ('done','doing')""",
                 (new_subject_id, status, user_guid, series_guid, season_number, old_subject_id)
+            )
+
+    def get_doing_movies(self, user_guid: str) -> list[dict]:
+        """获取处于在看状态的电影记录"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT item_guid, COALESCE(series_title, '') AS series_title,
+                          COALESCE(douban_subject_id, '') AS douban_subject_id
+                   FROM sync_state
+                   WHERE user_guid=? AND media_type='movie' AND status='doing'""",
+                (user_guid,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_doing_seasons(self, user_guid: str) -> list[dict]:
+        """按 (剧集, 季) 汇总仍处于在看状态的电视剧季（排除已有 done 记录的季）"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT series_guid, season_number,
+                          MAX(COALESCE(series_title, '')) AS series_title,
+                          MAX(COALESCE(douban_subject_id, '')) AS douban_subject_id,
+                          MAX(COALESCE(max_ep_watched, 0)) AS max_ep_watched,
+                          MAX(COALESCE(total_episodes, 0)) AS total_episodes
+                   FROM sync_state s
+                   WHERE s.user_guid=? AND s.media_type='episode' AND s.status='doing'
+                     AND s.series_guid IS NOT NULL AND s.series_guid != ''
+                     AND NOT EXISTS (
+                         SELECT 1 FROM sync_state d
+                         WHERE d.user_guid=s.user_guid AND d.series_guid=s.series_guid
+                           AND d.season_number=s.season_number AND d.status='done'
+                     )
+                   GROUP BY s.series_guid, s.season_number""",
+                (user_guid,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_protected_subject_ids(self, user_guid: str,
+                                  exclude_guids: set[str] | None = None) -> set[str]:
+        """返回不应移出豆瓣的 subject_id（已看完条目，及未在排除集合中的有效在看条目）"""
+        exclude = set(exclude_guids or ())
+        protected = set()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT item_guid, COALESCE(series_guid, '') AS series_guid,
+                          status, douban_subject_id
+                   FROM sync_state
+                   WHERE user_guid=? AND status IN ('done','doing')
+                     AND douban_subject_id IS NOT NULL AND douban_subject_id != ''""",
+                (user_guid,)
+            ).fetchall()
+            for r in rows:
+                if r["status"] == "done":
+                    protected.add(r["douban_subject_id"])
+                elif r["item_guid"] not in exclude and r["series_guid"] not in exclude:
+                    protected.add(r["douban_subject_id"])
+        return protected
+
+    def get_doing_log_subjects(self, item_guid: str) -> list[str]:
+        """从 mark_doing 日志中解析实际标记为在看的豆瓣条目 ID（排除分段已标记为 done 的 ID）"""
+        if not item_guid:
+            return []
+        sids = []
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT detail FROM sync_log WHERE action='mark_doing' AND item_guid=?",
+                (item_guid,)
+            ).fetchall()
+        for r in rows:
+            detail = r["detail"] or ""
+            done_ids = set(re.findall(r"(\d+)\(done\)", detail))
+            for sid in re.findall(r"(\d+)\(doing\)", detail):
+                if sid not in done_ids and sid not in sids:
+                    sids.append(sid)
+            m = re.search(r"豆瓣ID=(\d+)(?!\()", detail)
+            if m and m.group(1) not in done_ids and m.group(1) not in sids:
+                sids.append(m.group(1))
+        return sids
+
+    def mark_season_done(self, user_guid: str, series_guid: str, season_number: int,
+                         subject_id: str, max_ep_watched: int, total_episodes: int):
+        """将某季所有 doing 记录升级为 done"""
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """UPDATE sync_state
+                   SET status='done', douban_subject_id=?, max_ep_watched=?,
+                       total_episodes=?, last_synced_at=unixepoch()
+                   WHERE user_guid=? AND series_guid=? AND season_number=? AND status='doing'""",
+                (subject_id, max_ep_watched, total_episodes, user_guid, series_guid, season_number)
+            )
+
+    def delete_item_doing_state(self, user_guid: str, item_guid: str):
+        """删除已从飞牛库移除的电影 doing 记录"""
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM sync_state WHERE user_guid=? AND item_guid=? AND status='doing'",
+                (user_guid, item_guid)
+            )
+
+    def delete_season_doing_state(self, user_guid: str, series_guid: str, season_number: int):
+        """删除已从飞牛库移除的电视剧季 doing 记录"""
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM sync_state WHERE user_guid=? AND series_guid=? AND season_number=? AND status='doing'",
+                (user_guid, series_guid, season_number)
             )
 
     def get_stats(self, user_guid: str) -> dict:

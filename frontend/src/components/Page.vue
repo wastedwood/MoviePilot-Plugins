@@ -271,6 +271,8 @@ const actionLabels = {
   no_change_skip: '播放无变化',
   all_filtered: '进度均为 0',
   remove_wish: '移出想看',
+  remove_doing: '移出在看（已删）',
+  skip_deleted: '跳过（已从飞牛删除）',
   repair_subject: '修正豆瓣条目',
 }
 
@@ -282,6 +284,7 @@ const actionColors = {
   sync_error: 'error',
   auth_failed: 'error',
   remove_wish: 'info',
+  remove_doing: 'info',
   repair_subject: 'info',
 }
 
