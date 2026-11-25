@@ -36,7 +36,7 @@ class FntvDoubanSync(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/wastedwood/MoviePilot-Plugins/main/icons/fntvdoubansync.png"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "wastedwood"
     # 作者主页
@@ -399,6 +399,8 @@ class FntvDoubanSync(_PluginBase):
              "auth": "bear", "summary": "立即同步一次"},
             {"path": "/logs", "endpoint": self.api_logs, "methods": ["GET"],
              "auth": "bear", "summary": "分页查询同步日志"},
+            {"path": "/items", "endpoint": self.api_items, "methods": ["GET"],
+             "auth": "bear", "summary": "分页查询同步条目总览"},
             {"path": "/config", "endpoint": self.api_get_config, "methods": ["GET"],
              "auth": "bear", "summary": "读取插件配置"},
             {"path": "/config", "endpoint": self.api_save_config, "methods": ["POST"],
@@ -408,11 +410,13 @@ class FntvDoubanSync(_PluginBase):
     def api_status(self) -> dict:
         """GET /status：状态与统计概览"""
         stats = {"total": 0, "done": 0, "doing": 0, "failed": 0}
+        item_stats = {"total": 0, "done": 0, "doing": 0, "failed": 0}
         last_run = {"last_run_at": 0, "last_run_status": "", "last_run_message": ""}
         try:
             store = self._get_store()
             if self._selected_user:
                 stats = store.get_stats(self._selected_user)
+                item_stats = store.get_item_stats(self._selected_user)
             last_sync_time = store.get_last_sync_time()
             last_run = store.get_last_run()
         except Exception as e:
@@ -421,6 +425,7 @@ class FntvDoubanSync(_PluginBase):
         return {
             "running": self._is_running(),
             "enabled": bool(self._enabled),
+            "cron": self._cron,
             "fntv_db_path": self._fntv_db_path,
             "selected_user": self._selected_user,
             "cookie_source": self._cookie_source_label(),
@@ -429,6 +434,7 @@ class FntvDoubanSync(_PluginBase):
             "last_run_status": last_run["last_run_status"],
             "last_run_message": last_run["last_run_message"],
             "stats": stats,
+            "item_stats": item_stats,
         }
 
     def api_test_db(self, data: dict) -> dict:
@@ -516,6 +522,17 @@ class FntvDoubanSync(_PluginBase):
             "items": store.get_logs(limit=limit, offset=offset,
                                     action=action, keyword=keyword),
         }
+
+    def api_items(self, limit: int = 20, offset: int = 0,
+                  status: str = "", keyword: str = "") -> dict:
+        """GET /items：分页查询逻辑条目总览"""
+        limit = max(1, min(200, limit))
+        offset = max(0, offset)
+        if not self._selected_user:
+            return {"total": 0, "summary": {"total": 0, "done": 0, "doing": 0, "failed": 0}, "items": []}
+        return self._get_store().get_items(
+            self._selected_user, status=status, keyword=keyword, limit=limit, offset=offset
+        )
 
     def api_get_config(self) -> dict:
         """GET /config：读取当前完整配置"""

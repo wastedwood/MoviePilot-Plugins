@@ -113,11 +113,17 @@ const state = reactive({
   lastRunStatus: 'success',
   lastRunMessage: '✅ 已看完（2）\n• 庆余年 第二季\n• 沙丘 2\n本次共处理 3 项',
   stats: { total: 16, done: 12, doing: 3, failed: 1 },
+  itemStats: { total: 12, done: 8, doing: 3, failed: 1 },
+  items: [
+    { media_type: 'episode', entry_guid: 'tv-1', season_number: 2, series_title: '庆余年', status: 'done', douban_subject_id: '26647117', max_ep_watched: 36, total_episodes: 36, last_synced_at: nowSec - 1800, last_detail: '豆瓣ID=26647117(done) ep=36/36' },
+    { media_type: 'episode', entry_guid: 'tv-2', season_number: 1, series_title: '葬送的芙莉莲', status: 'doing', douban_subject_id: '35494922', max_ep_watched: 12, total_episodes: 28, last_synced_at: nowSec - 3600, last_detail: '豆瓣ID=35494922(doing) ep=12/28' },
+    { media_type: 'movie', entry_guid: 'm-1', season_number: 0, series_title: '测试冷门短片', status: 'failed', douban_subject_id: '', max_ep_watched: 0, total_episodes: 0, last_synced_at: nowSec - 86400, last_detail: '豆瓣搜索无结果' },
+  ],
   logs: [
-    { id: 4, action: 'mark_done', series_title: '庆余年 第二季', detail: '豆瓣ID=26647117(done) ep=36/36', created_at: nowSec - 1800 },
-    { id: 3, action: 'mark_doing', series_title: '葬送的芙莉莲', detail: '豆瓣ID=35494922(doing) ep=12/28', created_at: nowSec - 3600 },
-    { id: 2, action: 'skip_special', series_title: '进击的巨人', detail: '特别篇不同步', created_at: nowSec - 7200 },
-    { id: 1, action: 'error_search', series_title: '测试冷门短片', detail: '豆瓣搜索无结果', created_at: nowSec - 86400 },
+    { id: 4, action: 'mark_done', series_title: '庆余年 S2', season_number: 2, detail: '豆瓣ID=26647117(done) ep=36/36', created_at: nowSec - 1800 },
+    { id: 3, action: 'mark_doing', series_title: '葬送的芙莉莲 S1', season_number: 1, detail: '豆瓣ID=35494922(doing) ep=12/28', created_at: nowSec - 3600 },
+    { id: 2, action: 'skip_special', series_title: '进击的巨人', season_number: null, detail: '特别篇不同步', created_at: nowSec - 7200 },
+    { id: 1, action: 'error_search', series_title: '测试冷门短片', season_number: null, detail: '豆瓣搜索无结果', created_at: nowSec - 86400 },
   ],
 })
 
@@ -183,6 +189,7 @@ const mockApi = {
       return {
         running: state.running,
         enabled: state.config.enabled,
+        cron: state.config.cron,
         fntv_db_path: state.config.fntv_db_path,
         selected_user: state.config.selected_user,
         cookie_source: state.config.douban_cookie
@@ -195,6 +202,31 @@ const mockApi = {
         last_run_status: state.lastRunStatus,
         last_run_message: state.lastRunMessage,
         stats: state.stats,
+        item_stats: state.itemStats,
+      }
+    }
+    if (url.includes('items')) {
+      if (scenario.value === 'fresh') {
+        return { total: 0, summary: { total: 0, done: 0, doing: 0, failed: 0 }, items: [] }
+      }
+      const query = url.split('?')[1] || ''
+      const params = new URLSearchParams(query)
+      const st = params.get('status') || ''
+      const keyword = (params.get('keyword') || '').trim().toLowerCase()
+      const limit = Number(params.get('limit') || 20)
+      const offset = Number(params.get('offset') || 0)
+      const filtered = state.items.filter(item => {
+        if (st && item.status !== st) return false
+        if (keyword) {
+          const hay = `${item.series_title} ${item.douban_subject_id}`.toLowerCase()
+          if (!hay.includes(keyword)) return false
+        }
+        return true
+      })
+      return {
+        total: filtered.length,
+        summary: state.itemStats,
+        items: filtered.slice(offset, offset + limit),
       }
     }
     if (url.includes('logs')) {
@@ -203,12 +235,12 @@ const mockApi = {
       }
       const query = url.split('?')[1] || ''
       const params = new URLSearchParams(query)
-      const action = params.get('action') || ''
+      const actions = (params.get('action') || '').split(',').map(s => s.trim()).filter(Boolean)
       const keyword = (params.get('keyword') || '').trim().toLowerCase()
       const limit = Number(params.get('limit') || 20)
       const offset = Number(params.get('offset') || 0)
       const filtered = state.logs.filter(item => {
-        if (action && item.action !== action) return false
+        if (actions.length && !actions.includes(item.action)) return false
         if (keyword) {
           const hay = `${item.series_title} ${item.detail}`.toLowerCase()
           if (!hay.includes(keyword)) return false

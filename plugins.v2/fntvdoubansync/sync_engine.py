@@ -127,6 +127,14 @@ class SyncEngine:
         return clean_title, season_number
 
     @classmethod
+    def _display_tv_title(cls, series_title: str, season_number: int | None) -> str:
+        """生成带季号的日志/摘要标题，消除同名多季歧义"""
+        clean_title, effective_season = cls._resolve_season(series_title, season_number)
+        if effective_season and effective_season > 0:
+            return f"{clean_title} S{effective_season}"
+        return series_title
+
+    @classmethod
     def _build_tv_search_title(cls, series_title: str, season_number: int | None,
                                is_inferred: bool = False) -> str:
         """构造电视剧搜索词，避免多季剧集始终命中第一季"""
@@ -561,17 +569,18 @@ class SyncEngine:
                     continue
 
                 marked = self._mark_season(client, parts, "done", max_watched)
+                display_title = self._display_tv_title(series_title, season_number)
                 if marked:
                     self._store.mark_season_done(
                         user_guid, series_guid, season_number, parts[0][0], max_watched, total_eps
                     )
                     self._log(
-                        run_id, "mark_done", series_guid, series_title,
+                        run_id, "mark_done", series_guid, display_title,
                         f"豆瓣ID={','.join(marked)} ep={max_watched}/{total_eps}",
                     )
                     self._stats["done"] += 1
                 else:
-                    self._log(run_id, "error_api", series_guid, series_title,
+                    self._log(run_id, "error_api", series_guid, display_title,
                               f"升级看过失败 sid={parts[0][0]}")
                     self._stats["failed"] += 1
 
@@ -634,7 +643,8 @@ class SyncEngine:
                 self._store.delete_item_doing_state(user_guid, m["item_guid"])
 
         for s in inactive_seasons:
-            if _clear_deleted_entry(s["series_guid"], s["series_title"] or "未知剧集", s["douban_subject_id"]):
+            display_title = self._display_tv_title(s["series_title"] or "未知剧集", s["season_number"])
+            if _clear_deleted_entry(s["series_guid"], display_title, s["douban_subject_id"]):
                 self._store.delete_season_doing_state(user_guid, s["series_guid"], s["season_number"])
 
     # ── 通知 ────────────────────────────────────────
@@ -775,19 +785,20 @@ class SyncEngine:
         finally:
             conn.close()
 
+        display_title = self._display_tv_title(series_title, season_number)
         current_status = self._store.get_series_status(user_guid, series_guid,
                                                        season_number or 0)
 
         # 幂等：已完成则跳过
         if current_status == "done":
-            self._log(run_id, "skip_done", series_guid, series_title, "已标记看过")
+            self._log(run_id, "skip_done", series_guid, display_title, "已标记看过")
             self._stats["skipped"] += 1
             return
 
         # 决定目标状态前，先检查已从飞牛库删除的剧集是否仍需标记「在看」
         is_complete_preview = total_eps > 0 and max(max_watched, played_max) >= total_eps
         if not is_active and current_status in (None, "pending") and not is_complete_preview:
-            self._log(run_id, "skip_deleted", series_guid, series_title, "已从飞牛库删除，不标记在看")
+            self._log(run_id, "skip_deleted", series_guid, display_title, "已从飞牛库删除，不标记在看")
             self._stats["skipped"] += 1
             return
 
@@ -866,22 +877,22 @@ class SyncEngine:
                                              max_ep_watched=max_watched,
                                              total_episodes=total_eps,
                                              play_update_time=play["play_update_time"])
-                self._log(run_id, "error_api", series_guid, series_title,
+                self._log(run_id, "error_api", series_guid, display_title,
                           self._failure_detail(client, errors, plays,
                                                f"标记{interest}失败 sid={subject_id}"))
-                logger.error("[%s] 豆瓣标记[%s]失败: %s", run_id, interest, series_title)
+                logger.error("[%s] 豆瓣标记[%s]失败: %s", run_id, interest, display_title)
                 self._stats["failed"] += 1
                 return
             action = "mark_done" if interest == "done" else "mark_doing"
-            self._log(run_id, action, series_guid, series_title,
+            self._log(run_id, action, series_guid, display_title,
                       f"豆瓣ID={','.join(marked)} ep={max_watched}/{total_eps}")
-            logger.info("[%s] %s: %s (%s)", run_id, action, series_title, interest)
+            logger.info("[%s] %s: %s (%s)", run_id, action, display_title, interest)
             if interest == "done":
                 self._stats["done"] += 1
             else:
                 self._stats["doing"] += 1
         else:
-            self._log(run_id, "skip_middle", series_guid, series_title,
+            self._log(run_id, "skip_middle", series_guid, display_title,
                       f"中间集跳过 ep={max_watched}/{total_eps}")
             self._stats["skipped"] += 1
 

@@ -275,6 +275,115 @@ class SyncStore:
                 "failed": row["failed"],
             }
 
+    _ITEMS_CTE = """
+        WITH grouped AS (
+            SELECT
+                media_type,
+                CASE WHEN media_type = 'movie' THEN item_guid
+                     ELSE COALESCE(NULLIF(series_guid, ''), item_guid)
+                END AS entry_guid,
+                CASE WHEN media_type = 'movie' THEN 0
+                     ELSE COALESCE(season_number, 0)
+                END AS season_number,
+                MAX(COALESCE(series_title, '')) AS series_title,
+                CASE
+                    WHEN SUM(status = 'done') > 0 THEN 'done'
+                    WHEN SUM(status = 'doing') > 0 THEN 'doing'
+                    WHEN SUM(status = 'failed') > 0 THEN 'failed'
+                    ELSE 'pending'
+                END AS status,
+                COALESCE(
+                    NULLIF(MAX(CASE WHEN status IN ('done', 'doing') THEN COALESCE(douban_subject_id, '') ELSE '' END), ''),
+                    MAX(COALESCE(douban_subject_id, ''))
+                ) AS douban_subject_id,
+                MAX(COALESCE(max_ep_watched, episode_number, 0)) AS max_ep_watched,
+                MAX(COALESCE(total_episodes, 0)) AS total_episodes,
+                MAX(COALESCE(last_synced_at, 0)) AS last_synced_at
+            FROM sync_state
+            WHERE user_guid = ?
+            GROUP BY
+                media_type,
+                CASE WHEN media_type = 'movie' THEN item_guid
+                     ELSE COALESCE(NULLIF(series_guid, ''), item_guid)
+                END,
+                CASE WHEN media_type = 'movie' THEN 0
+                     ELSE COALESCE(season_number, 0)
+                END
+        )
+    """
+
+    def get_item_stats(self, user_guid: str) -> dict:
+        """按逻辑条目（电影按片、剧集按季）统计同步状态"""
+        if not user_guid:
+            return {"total": 0, "done": 0, "doing": 0, "failed": 0}
+        sql = (
+            self._ITEMS_CTE
+            + """SELECT COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN status='done' THEN 1 ELSE 0 END), 0) AS done,
+                        COALESCE(SUM(CASE WHEN status='doing' THEN 1 ELSE 0 END), 0) AS doing,
+                        COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), 0) AS failed
+                 FROM grouped"""
+        )
+        with closing(self._connect()) as conn:
+            row = conn.execute(sql, (user_guid,)).fetchone()
+            return {
+                "total": row["total"],
+                "done": row["done"],
+                "doing": row["doing"],
+                "failed": row["failed"],
+            }
+
+    def get_items(self, user_guid: str, status: str = "", keyword: str = "",
+                  limit: int = 20, offset: int = 0) -> dict:
+        """分页查询逻辑条目总览（支持状态与关键词筛选）"""
+        if not user_guid:
+            return {"total": 0, "summary": {"total": 0, "done": 0, "doing": 0, "failed": 0}, "items": []}
+        summary = self.get_item_stats(user_guid)
+        where, params = [], [user_guid]
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if keyword:
+            where.append("(series_title LIKE ? OR douban_subject_id LIKE ?)")
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        count_sql = self._ITEMS_CTE + f"SELECT COUNT(*) AS c FROM grouped{clause}"
+        list_sql = (
+            self._ITEMS_CTE
+            + f"SELECT * FROM grouped{clause} ORDER BY last_synced_at DESC, series_title ASC LIMIT ? OFFSET ?"
+        )
+        with closing(self._connect()) as conn:
+            total = conn.execute(count_sql, params).fetchone()["c"]
+            rows = conn.execute(list_sql, [*params, limit, offset]).fetchall()
+            items = [dict(r) for r in rows]
+            if items:
+                guids = list({it["entry_guid"] for it in items if it.get("entry_guid")})
+                latest_all, latest_err = {}, {}
+                if guids:
+                    placeholders = ", ".join("?" for _ in guids)
+                    log_rows = conn.execute(
+                        f"""SELECT item_guid, action, detail
+                            FROM sync_log
+                            WHERE item_guid IN ({placeholders})
+                            ORDER BY created_at DESC, id DESC""",
+                        guids,
+                    ).fetchall()
+                    for lr in log_rows:
+                        g = lr["item_guid"]
+                        detail = lr["detail"] or ""
+                        if g not in latest_all:
+                            latest_all[g] = detail
+                        if (lr["action"] or "").startswith("error") or lr["action"] == "auth_failed":
+                            if g not in latest_err:
+                                latest_err[g] = detail
+                for it in items:
+                    g = it.get("entry_guid", "")
+                    if it.get("status") == "failed":
+                        it["last_detail"] = latest_err.get(g) or latest_all.get(g, "")
+                    else:
+                        it["last_detail"] = latest_all.get(g, "")
+            return {"total": total, "summary": summary, "items": items}
+
     # ── 同步日志 ─────────────────────────────────────
 
     def log_action(self, run_id: str, action: str, item_guid: str = "",
@@ -289,13 +398,28 @@ class SyncStore:
         """组装 sync_log 过滤条件，返回 (WHERE 片段, 参数列表)"""
         where, params = [], []
         if action:
-            where.append("action = ?")
-            params.append(action)
+            actions = [a.strip() for a in str(action).split(",") if a.strip()]
+            if len(actions) > 1:
+                placeholders = ", ".join("?" for _ in actions)
+                where.append(f"action IN ({placeholders})")
+                params.extend(actions)
+            elif actions:
+                where.append("action = ?")
+                params.append(actions[0])
         if keyword:
             where.append("(series_title LIKE ? OR detail LIKE ?)")
             params.extend([f"%{keyword}%", f"%{keyword}%"])
         clause = f" WHERE {' AND '.join(where)}" if where else ""
         return clause, params
+
+    @staticmethod
+    def _extract_detail_sids(detail: str) -> set[str]:
+        sids = set()
+        for m in re.finditer(r"(?:豆瓣ID=|sid=)(\d{6,10})|(\d{6,10})\((?:done|doing)\)", detail or ""):
+            sid = m.group(1) or m.group(2)
+            if sid:
+                sids.add(sid)
+        return sids
 
     def get_logs(self, limit: int = 50, offset: int = 0,
                  action: str = "", keyword: str = "") -> list[dict]:
@@ -303,7 +427,39 @@ class SyncStore:
         sql = f"SELECT * FROM sync_log{clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         with closing(self._connect()) as conn:
             rows = conn.execute(sql, [*params, limit, offset]).fetchall()
-            return [dict(r) for r in rows]
+            items = [dict(r) for r in rows]
+            guids = list({it["item_guid"] for it in items if it.get("item_guid")})
+            by_guid: dict[str, list[tuple[str, int]]] = {}
+            if guids:
+                placeholders = ", ".join("?" for _ in guids)
+                state_rows = conn.execute(
+                    f"""SELECT series_guid, item_guid, season_number, COALESCE(douban_subject_id, '') AS sid
+                        FROM sync_state
+                        WHERE media_type='episode' AND season_number IS NOT NULL AND season_number > 0
+                          AND (series_guid IN ({placeholders}) OR item_guid IN ({placeholders}))""",
+                    [*guids, *guids],
+                ).fetchall()
+                for sr in state_rows:
+                    pair = (sr["sid"], int(sr["season_number"]))
+                    for key in (sr["series_guid"], sr["item_guid"]):
+                        if key:
+                            by_guid.setdefault(key, []).append(pair)
+            for it in items:
+                candidates = by_guid.get(it.get("item_guid") or "", [])
+                matched_season = None
+                if candidates:
+                    detail_sids = self._extract_detail_sids(it.get("detail") or "")
+                    if detail_sids:
+                        for sid, season in candidates:
+                            if sid and sid in detail_sids:
+                                matched_season = season
+                                break
+                    if matched_season is None:
+                        distinct_seasons = {season for _, season in candidates}
+                        if len(distinct_seasons) == 1:
+                            matched_season = next(iter(distinct_seasons))
+                it["season_number"] = matched_season
+            return items
 
     def count_logs(self, action: str = "", keyword: str = "") -> int:
         clause, params = self._log_filters(action, keyword)

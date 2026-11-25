@@ -111,7 +111,7 @@ class PluginConfigTests(unittest.TestCase):
         expected = {
             ("/status", "GET"), ("/fntv/test-db", "POST"), ("/fntv/users", "GET"),
             ("/douban/check-cookie", "POST"), ("/sync/run", "POST"), ("/logs", "GET"),
-            ("/config", "GET"), ("/config", "POST"),
+            ("/items", "GET"), ("/config", "GET"), ("/config", "POST"),
         }
         self.assertTrue(expected.issubset(paths))
         for api in self.plugin.get_api():
@@ -279,7 +279,9 @@ def test_api_status(plugin, fntv_db_file):
     assert status["last_run_at"] == 0
     assert status["last_run_status"] == ""
     assert status["last_run_message"] == ""
+    assert status["cron"] == "0 3 * * *"
     assert status["stats"] == {"total": 0, "done": 0, "doing": 0, "failed": 0}
+    assert status["item_stats"] == {"total": 0, "done": 0, "doing": 0, "failed": 0}
 
 
 def test_init_plugin_empty_preserves_default_db_path(plugin):
@@ -398,6 +400,79 @@ def test_api_logs_pagination_and_filters(plugin):
 
     ret = plugin.api_logs(limit=1, offset=1)
     assert len(ret["items"]) == 1
+
+    ret = plugin.api_logs(action="mark_done,error_search")
+    assert ret["total"] == 3
+
+
+def test_api_logs_enriches_season_number(plugin):
+    store = plugin._get_store()
+    store.upsert_state(
+        "u1", "ep-1", media_type="episode", series_guid="tv-mds",
+        season_number=1, series_title="马大帅", status="done",
+        douban_subject_id="2997297", max_ep_watched=27, total_episodes=27,
+    )
+    store.upsert_state(
+        "u1", "ep-2", media_type="episode", series_guid="tv-mds",
+        season_number=2, series_title="马大帅", status="done",
+        douban_subject_id="4043850", max_ep_watched=30, total_episodes=30,
+    )
+    store.log_action("r1", "mark_done", "tv-mds", "马大帅", "豆瓣ID=4043850(done) ep=30/30")
+    store.log_action("r1", "mark_done", "tv-mds", "马大帅", "豆瓣ID=2997297(done) ep=27/27")
+
+    logs = plugin.api_logs()["items"]
+    by_detail = {item["detail"]: item["season_number"] for item in logs}
+    assert by_detail["豆瓣ID=4043850(done) ep=30/30"] == 2
+    assert by_detail["豆瓣ID=2997297(done) ep=27/27"] == 1
+
+
+def test_api_items_grouping_filters_and_failure_detail(plugin, fntv_db_file):
+    plugin.init_plugin(config_with(fntv_db_file))
+    store = plugin._get_store()
+    # 同季多集聚合为一条 logic item
+    store.upsert_state(
+        "u1", "ep-s1-1", media_type="episode", series_guid="tv-1",
+        season_number=1, series_title="马大帅", status="doing",
+        douban_subject_id="2997297", episode_number=1,
+        max_ep_watched=10, total_episodes=27,
+    )
+    store.upsert_state(
+        "u1", "ep-s1-2", media_type="episode", series_guid="tv-1",
+        season_number=1, series_title="马大帅", status="done",
+        douban_subject_id="2997297", episode_number=27,
+        max_ep_watched=27, total_episodes=27,
+    )
+    store.upsert_state(
+        "u1", "ep-s2-1", media_type="episode", series_guid="tv-1",
+        season_number=2, series_title="马大帅", status="doing",
+        douban_subject_id="4043850", episode_number=5,
+        max_ep_watched=5, total_episodes=30,
+    )
+    store.upsert_state(
+        "u1", "mov-fail", media_type="movie", series_title="异常影片",
+        status="failed",
+    )
+    store.log_action("r1", "error_search", "mov-fail", "异常影片", "豆瓣搜索无结果")
+
+    all_ret = plugin.api_items()
+    assert all_ret["summary"] == {"total": 3, "done": 1, "doing": 1, "failed": 1}
+    assert all_ret["total"] == 3
+
+    doing_ret = plugin.api_items(status="doing")
+    assert doing_ret["total"] == 1
+    assert doing_ret["items"][0]["season_number"] == 2
+    assert doing_ret["items"][0]["max_ep_watched"] == 5
+
+    failed_ret = plugin.api_items(status="failed")
+    assert failed_ret["total"] == 1
+    assert failed_ret["items"][0]["last_detail"] == "豆瓣搜索无结果"
+
+    kw_ret = plugin.api_items(keyword="4043850")
+    assert kw_ret["total"] == 1
+    assert kw_ret["items"][0]["season_number"] == 2
+
+    paged = plugin.api_items(limit=1, offset=1)
+    assert len(paged["items"]) == 1
 
 
 def test_api_config_roundtrip(plugin, fntv_db_file):

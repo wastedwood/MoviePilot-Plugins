@@ -2,9 +2,9 @@
   <v-card :flat="!config?.attrs?.border" class="fntv-dashboard">
     <v-card-item class="pb-2">
       <template #prepend>
-        <v-avatar color="primary" variant="tonal" size="30" rounded="lg">
+        <div class="fntv-dash-icon">
           <v-icon size="16">mdi-sync</v-icon>
-        </v-avatar>
+        </div>
       </template>
       <v-card-title class="text-subtitle-1 font-weight-bold">
         {{ config?.attrs?.title || '飞牛影视豆瓣同步' }}
@@ -37,28 +37,25 @@
         <v-progress-circular indeterminate color="primary" size="24" />
       </div>
       <div v-else>
-        <v-row dense class="mb-3">
-          <v-col cols="4">
-            <v-sheet border rounded="lg" class="pa-2 text-center">
-              <div class="text-caption text-medium-emphasis">看过</div>
-              <div class="text-h6 font-weight-bold text-success">{{ status.stats?.done ?? 0 }}</div>
-            </v-sheet>
-          </v-col>
-          <v-col cols="4">
-            <v-sheet border rounded="lg" class="pa-2 text-center">
-              <div class="text-caption text-medium-emphasis">在看</div>
-              <div class="text-h6 font-weight-bold text-info">{{ status.stats?.doing ?? 0 }}</div>
-            </v-sheet>
-          </v-col>
-          <v-col cols="4">
-            <v-sheet border rounded="lg" class="pa-2 text-center">
-              <div class="text-caption text-medium-emphasis">失败</div>
-              <div class="text-h6 font-weight-bold" :class="{ 'text-error': (status.stats?.failed ?? 0) > 0 }">
-                {{ status.stats?.failed ?? 0 }}
-              </div>
-            </v-sheet>
-          </v-col>
-        </v-row>
+        <div class="fntv-dash-grid mb-3">
+          <div class="fntv-dash-kpi">
+            <div class="text-caption text-medium-emphasis">看过</div>
+            <div class="text-h6 font-weight-bold text-success fntv-tabular">{{ dashStats.done }}</div>
+          </div>
+          <div class="fntv-dash-kpi">
+            <div class="text-caption text-medium-emphasis">在看</div>
+            <div class="text-h6 font-weight-bold text-info fntv-tabular">{{ dashStats.doing }}</div>
+          </div>
+          <div class="fntv-dash-kpi">
+            <div class="text-caption text-medium-emphasis">异常</div>
+            <div
+              class="text-h6 font-weight-bold fntv-tabular"
+              :class="dashStats.failed > 0 ? 'text-error' : 'text-medium-emphasis'"
+            >
+              {{ dashStats.failed }}
+            </div>
+          </div>
+        </div>
 
         <div class="d-flex align-center justify-space-between text-caption mb-1">
           <span class="text-medium-emphasis">最近同步</span>
@@ -95,6 +92,7 @@ const status = ref({
   last_sync_time: 0,
   last_run_at: 0,
   stats: {},
+  item_stats: null,
 })
 const recentText = ref('')
 const loading = ref(false)
@@ -113,6 +111,15 @@ const actionLabels = {
   skip_deleted: '跳过已删除',
   repair_subject: '修正条目',
 }
+
+const dashStats = computed(() => {
+  const src = status.value.item_stats || status.value.stats || {}
+  return {
+    done: Number(src.done || 0),
+    doing: Number(src.doing || 0),
+    failed: Number(src.failed || 0),
+  }
+})
 
 const lastTs = computed(() => status.value.last_run_at || status.value.last_sync_time || 0)
 
@@ -136,6 +143,18 @@ const shortRunTime = computed(() => {
   })
 })
 
+function formatRecentDetail(detail) {
+  const raw = String(detail || '').trim()
+  if (!raw) return ''
+  const epMatch = raw.match(/\bep=(\d+\/\d+)\b/)
+  const sidMatch = raw.match(/(?:豆瓣ID=|sid=)(\d{6,10})/)
+  const parts = []
+  if (epMatch) parts.push(`${epMatch[1]} 集`)
+  if (sidMatch) parts.push(`豆瓣 ${sidMatch[1]}`)
+  if (parts.length) return parts.join(' · ')
+  return raw
+}
+
 async function load() {
   if (!props.api) return
   loading.value = true
@@ -145,7 +164,8 @@ async function load() {
     const recent = res.items?.[0]
     if (recent) {
       const label = actionLabels[recent.action] || recent.action
-      recentText.value = [label, recent.series_title, recent.detail].filter(Boolean).join(' · ')
+      const detail = formatRecentDetail(recent.detail)
+      recentText.value = [label, recent.series_title, detail].filter(Boolean).join(' · ')
     } else {
       recentText.value = ''
     }
@@ -176,5 +196,31 @@ onUnmounted(() => {
 <style scoped>
 .fntv-dashboard {
   width: 100%;
+}
+.fntv-dash-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.12);
+  border: 1px solid rgba(var(--v-theme-primary), 0.24);
+}
+.fntv-dash-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.fntv-dash-kpi {
+  border-radius: 8px;
+  padding: 8px 6px;
+  text-align: center;
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.12);
+  background: rgba(var(--v-theme-on-surface), 0.025);
+}
+.fntv-tabular {
+  font-variant-numeric: tabular-nums;
 }
 </style>
